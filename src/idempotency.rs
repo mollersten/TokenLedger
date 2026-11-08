@@ -6,9 +6,11 @@
 //! anything else is rejected with `422` instead of silently returning a
 //! response that belongs to a different request.
 //!
-//! The response row is written inside the same transaction as the balance
-//! change, while the tenant's wallet row is locked, so concurrent requests
-//! carrying the same key serialise on that lock and all but the first replay.
+//! The response row is inserted by the same statement that applies the
+//! balance change (`ledger::WriteSet::flush`), while the tenant's wallet row
+//! is locked. That insert uses `ON CONFLICT DO NOTHING` and gates every other
+//! write, so concurrent requests carrying the same key serialise on the lock,
+//! the first one executes, and the rest write nothing and replay its response.
 
 use axum::{
     Json,
@@ -18,7 +20,7 @@ use axum::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{error::ApiError, models::Outcome};
+use crate::error::ApiError;
 
 pub const HEADER: &str = "idempotency-key";
 pub const REPLAYED_HEADER: &str = "idempotent-replayed";
@@ -106,30 +108,6 @@ where
     .bind(key)
     .fetch_optional(executor)
     .await
-}
-
-pub async fn store(
-    conn: &mut sqlx::PgConnection,
-    tenant_id: &str,
-    key: &str,
-    endpoint: &str,
-    hash: &str,
-    outcome: &Outcome,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO idempotency_keys \
-           (tenant_id, idempotency_key, endpoint, request_hash, response_status, response_body) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(tenant_id)
-    .bind(key)
-    .bind(endpoint)
-    .bind(hash)
-    .bind(outcome.status.as_u16() as i16)
-    .bind(&outcome.body)
-    .execute(conn)
-    .await?;
-    Ok(())
 }
 
 /// Turn a stored response into the HTTP reply, or reject a mismatched reuse.

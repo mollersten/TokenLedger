@@ -99,7 +99,9 @@ pub async fn run_once(pool: &PgPool, batch_size: i64) -> Result<ReapStats, ApiEr
         }
         match wallets.get_mut(&reservation.tenant_id).and_then(Option::as_mut) {
             Some(wallet) => {
-                ledger::expire_reservation(&mut tx, wallet, reservation, "reaper").await?;
+                let mut writes = ledger::WriteSet::new(&reservation.tenant_id);
+                ledger::expire(&mut writes, wallet, reservation, "reaper")?;
+                writes.flush(&mut tx).await?;
                 stats.expired += 1;
             }
             None => stats.skipped += 1,

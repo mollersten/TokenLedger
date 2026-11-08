@@ -16,7 +16,7 @@ use crate::{
     AppState,
     error::ApiError,
     idempotency, ledger,
-    models::{CommitRequest, GrantRequest, Outcome, ReleaseRequest, ReserveRequest, validate_tenant_id},
+    models::{CommitRequest, GrantRequest, ReleaseRequest, ReserveRequest, validate_tenant_id},
 };
 
 const RECENT_LEDGER_LIMIT: i64 = 20;
@@ -97,10 +97,13 @@ impl Mutation {
 ///
 /// 1. Validate `Idempotency-Key` and the body (failures are not cached).
 /// 2. Fast path: replay a stored response without taking any lock.
-/// 3. `BEGIN`, lock the wallet row `FOR UPDATE` (grant upserts it first).
-/// 4. Re-check the key under the lock: a concurrent duplicate that committed
-///    while we waited is replayed instead of executed twice.
-/// 5. Run the operation, store its response in `idempotency_keys`, `COMMIT`.
+/// 3. `BEGIN`, lock the wallet row `FOR UPDATE` (grant creates it if needed).
+/// 4. Decide the outcome and its writes in memory (commit/release read the
+///    reservation first).
+/// 5. Flush all writes plus the idempotency record in one statement, gated
+///    on the idempotency insert: if a duplicate with the same key committed
+///    while we waited for the lock, nothing is written and its stored
+///    response is replayed instead. Otherwise `COMMIT`.
 async fn execute(
     state: &AppState,
     headers: &HeaderMap,
@@ -119,26 +122,30 @@ async fn execute(
     }
 
     let mut tx = state.pool.begin().await?;
-    if matches!(mutation, Mutation::Grant(_)) {
-        ledger::ensure_wallet(&mut tx, &tenant_id).await?;
-    }
-    let Some(mut wallet) = ledger::lock_wallet(&mut tx, &tenant_id).await? else {
+    let locked = match &mutation {
+        Mutation::Grant(_) => Some(ledger::lock_or_create_wallet(&mut tx, &tenant_id).await?),
+        _ => ledger::lock_wallet(&mut tx, &tenant_id).await?,
+    };
+    let Some(ledger::LockedWallet { mut wallet, now }) = locked else {
         tx.rollback().await?;
         return Err(ApiError::wallet_not_found(&tenant_id));
     };
-    if let Some(stored) = idempotency::lookup(&mut *tx, &tenant_id, &key).await? {
-        tx.rollback().await?;
-        return idempotency::replay(stored, endpoint.path(), &hash);
-    }
 
-    let outcome: Outcome = match mutation {
-        Mutation::Grant(req) => ledger::grant(&mut tx, &mut wallet, req).await?,
-        Mutation::Reserve(req) => ledger::reserve(&mut tx, &mut wallet, req).await?,
-        Mutation::Commit(req) => ledger::commit(&mut tx, &mut wallet, req).await?,
-        Mutation::Release(req) => ledger::release(&mut tx, &mut wallet, req).await?,
+    let ledger::Plan { outcome, mut writes } = match mutation {
+        Mutation::Grant(req) => ledger::grant(&mut wallet, now, req)?,
+        Mutation::Reserve(req) => ledger::reserve(&mut wallet, now, req)?,
+        Mutation::Commit(req) => ledger::commit(&mut tx, &mut wallet, now, req).await?,
+        Mutation::Release(req) => ledger::release(&mut tx, &mut wallet, now, req).await?,
     };
 
-    idempotency::store(&mut tx, &tenant_id, &key, endpoint.path(), &hash, &outcome).await?;
+    writes.record_idempotency(&key, endpoint.path(), &hash, &outcome);
+    if !writes.flush(&mut tx).await? {
+        tx.rollback().await?;
+        let stored = idempotency::lookup(&state.pool, &tenant_id, &key)
+            .await?
+            .ok_or_else(|| ApiError::internal("idempotency key conflicted but no stored response was found"))?;
+        return idempotency::replay(stored, endpoint.path(), &hash);
+    }
     tx.commit().await?;
 
     Ok((outcome.status, Json(outcome.body)).into_response())

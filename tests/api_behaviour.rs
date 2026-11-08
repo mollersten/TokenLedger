@@ -129,6 +129,41 @@ async fn concurrent_first_grants_create_one_wallet() {
     app.assert_ledger_reconciles(&tenant).await;
 }
 
+/// Both requests pass the lock-free idempotency fast path, then queue on the
+/// wallet lock. The second must be stopped by the idempotency gate inside the
+/// write statement and replay the first one's response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_queued_behind_lock_replays_via_gate() {
+    let app = TestApp::spawn().await;
+    let tenant = unique_tenant("cus_gate");
+    app.grant(&tenant, 100).await;
+
+    let mut holder = app.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM wallets WHERE tenant_id = $1 FOR UPDATE")
+        .bind(&tenant)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let key = new_key();
+    let body = json!({ "tenant_id": tenant, "feature": "gate", "estimate_credits": 10, "ttl_seconds": 300 });
+    let spawn_reserve = || {
+        let (router, key, body) = (app.router.clone(), key.clone(), body.clone());
+        tokio::spawn(async move { post(router, "/v1/credits/reserve", &key, body).await })
+    };
+    let (first, second) = (spawn_reserve(), spawn_reserve());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    holder.rollback().await.unwrap();
+
+    let (a, b) = (first.await.unwrap(), second.await.unwrap());
+    assert_eq!((a.status, b.status), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(a.body, b.body);
+    assert_eq!([a.replayed, b.replayed].iter().filter(|r| **r).count(), 1, "exactly one replay");
+    assert_eq!(app.count_reservations(&tenant).await, 1);
+    assert_eq!(app.balances(&tenant).await, (90, 10));
+    app.assert_ledger_reconciles(&tenant).await;
+}
+
 #[tokio::test]
 async fn overdue_reservation_is_expired_lazily_on_commit() {
     let app = TestApp::spawn().await;
