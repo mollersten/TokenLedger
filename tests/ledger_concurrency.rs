@@ -22,7 +22,7 @@ async fn test_1_two_button_mash_race_condition() {
     let barrier = Arc::new(Barrier::new(TASKS));
     let mut handles = Vec::with_capacity(TASKS);
     for i in 0..TASKS {
-        let router = app.router.clone();
+        let router = app.api.clone();
         let barrier = barrier.clone();
         let tenant = tenant.clone();
         handles.push(tokio::spawn(async move {
@@ -35,7 +35,7 @@ async fn test_1_two_button_mash_race_condition() {
             });
             let key = format!("mash-{i}-{}", new_key());
             barrier.wait().await;
-            post(router, "/v1/credits/reserve", &key, body).await
+            post(&router, "/v1/credits/reserve", &key, body).await
         }));
     }
 
@@ -85,10 +85,10 @@ async fn test_2_glitchy_wifi_idempotency_replay() {
     let barrier = Arc::new(Barrier::new(TASKS));
     let mut handles = Vec::with_capacity(TASKS);
     for _ in 0..TASKS {
-        let (router, barrier, key, body) = (app.router.clone(), barrier.clone(), key.clone(), body.clone());
+        let (router, barrier, key, body) = (app.api.clone(), barrier.clone(), key.clone(), body.clone());
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
-            post(router, "/v1/credits/reserve", &key, body).await
+            post(&router, "/v1/credits/reserve", &key, body).await
         }));
     }
 

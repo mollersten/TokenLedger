@@ -91,15 +91,17 @@ pub async fn run_once(pool: &PgPool, batch_size: i64) -> Result<ReapStats, ApiEr
         return Ok(stats);
     }
 
-    let mut wallets: HashMap<String, Option<Wallet>> = HashMap::new();
+    let mut wallets: HashMap<(String, String), Option<Wallet>> = HashMap::new();
     for reservation in &due {
-        if !wallets.contains_key(&reservation.tenant_id) {
-            let wallet = ledger::try_lock_wallet(&mut tx, &reservation.tenant_id).await?;
-            wallets.insert(reservation.tenant_id.clone(), wallet);
+        let wallet_key = (reservation.account_id.clone(), reservation.tenant_id.clone());
+        if !wallets.contains_key(&wallet_key) {
+            let wallet =
+                ledger::try_lock_wallet(&mut tx, &reservation.account_id, &reservation.tenant_id).await?;
+            wallets.insert(wallet_key.clone(), wallet);
         }
-        match wallets.get_mut(&reservation.tenant_id).and_then(Option::as_mut) {
+        match wallets.get_mut(&wallet_key).and_then(Option::as_mut) {
             Some(wallet) => {
-                let mut writes = ledger::WriteSet::new(&reservation.tenant_id);
+                let mut writes = ledger::WriteSet::new(&reservation.account_id, &reservation.tenant_id);
                 ledger::expire(&mut writes, wallet, reservation, "reaper")?;
                 writes.flush(&mut tx).await?;
                 stats.expired += 1;

@@ -1,6 +1,7 @@
 //! `Idempotency-Key` handling.
 //!
-//! Keys are scoped per tenant (`PRIMARY KEY (tenant_id, idempotency_key)`).
+//! Keys are scoped per account and tenant
+//! (`PRIMARY KEY (account_id, tenant_id, idempotency_key)`).
 //! A key replays the stored status + body only when it is reused on the same
 //! endpoint with a byte-for-byte equivalent (canonicalised) JSON body;
 //! anything else is rejected with `422` instead of silently returning a
@@ -94,6 +95,7 @@ fn write_canonical(value: &Value, out: &mut String) {
 
 pub async fn lookup<'e, E>(
     executor: E,
+    account_id: &str,
     tenant_id: &str,
     key: &str,
 ) -> Result<Option<StoredResponse>, sqlx::Error>
@@ -101,9 +103,10 @@ where
     E: sqlx::PgExecutor<'e>,
 {
     sqlx::query_as::<_, StoredResponse>(
-        "SELECT endpoint, request_hash, response_status, response_body \
-         FROM idempotency_keys WHERE tenant_id = $1 AND idempotency_key = $2",
+        "SELECT endpoint, request_hash, response_status, response_body FROM idempotency_keys \
+         WHERE account_id = $1 AND tenant_id = $2 AND idempotency_key = $3",
     )
+    .bind(account_id)
     .bind(tenant_id)
     .bind(key)
     .fetch_optional(executor)

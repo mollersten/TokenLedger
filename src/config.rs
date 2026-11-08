@@ -1,6 +1,6 @@
 use std::{env, net::SocketAddr, time::Duration};
 
-use crate::reaper;
+use crate::{auth, reaper};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -8,6 +8,15 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub max_connections: u32,
     pub reaper_interval: Duration,
+    pub auth_cache_ttl: Duration,
+    pub usage_flush_interval: Duration,
+}
+
+fn millis(name: &str, default: Duration) -> Result<Duration, String> {
+    match env::var(name) {
+        Ok(v) => Ok(Duration::from_millis(v.parse().map_err(|e| format!("invalid {name}: {e}"))?)),
+        Err(_) => Ok(default),
+    }
 }
 
 impl Config {
@@ -22,12 +31,13 @@ impl Config {
             Ok(v) => v.parse().map_err(|e| format!("invalid DATABASE_MAX_CONNECTIONS: {e}"))?,
             Err(_) => 20,
         };
-        let reaper_interval = match env::var("REAPER_INTERVAL_MS") {
-            Ok(v) => Duration::from_millis(
-                v.parse().map_err(|e| format!("invalid REAPER_INTERVAL_MS: {e}"))?,
-            ),
-            Err(_) => reaper::DEFAULT_INTERVAL,
-        };
-        Ok(Self { database_url, bind_addr, max_connections, reaper_interval })
+        Ok(Self {
+            database_url,
+            bind_addr,
+            max_connections,
+            reaper_interval: millis("REAPER_INTERVAL_MS", reaper::DEFAULT_INTERVAL)?,
+            auth_cache_ttl: millis("AUTH_CACHE_TTL_MS", auth::DEFAULT_AUTH_CACHE_TTL)?,
+            usage_flush_interval: millis("USAGE_FLUSH_INTERVAL_MS", auth::DEFAULT_USAGE_FLUSH_INTERVAL)?,
+        })
     }
 }

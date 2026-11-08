@@ -66,31 +66,67 @@ pub struct LockedWallet {
 /// Pessimistic lock on the tenant's wallet row; waits for other writers.
 pub async fn lock_wallet(
     conn: &mut PgConnection,
+    account_id: &str,
     tenant_id: &str,
 ) -> Result<Option<LockedWallet>, sqlx::Error> {
     sqlx::query_as::<_, LockedWallet>(&format!(
-        "SELECT {WALLET_COLUMNS}, NOW() AS now FROM wallets WHERE tenant_id = $1 FOR UPDATE"
+        "SELECT {WALLET_COLUMNS}, NOW() AS now FROM wallets \
+         WHERE account_id = $1 AND tenant_id = $2 FOR UPDATE"
     ))
+    .bind(account_id)
     .bind(tenant_id)
     .fetch_optional(conn)
     .await
 }
 
 /// Lock the wallet, creating it first if the tenant has none (grant only).
-/// Concurrent creators of the same new tenant block on the uncommitted
-/// insert, then see the conflict and fall through to the lock.
+///
+/// For accounts with a tenant limit, creating a wallet takes
+/// `FOR NO KEY UPDATE` on the account row, so concurrent creations for one
+/// account serialise and the `max_tenants` check cannot be raced past. (That
+/// lock mode does not conflict with the key-share locks foreign keys take.)
+/// Unlimited accounts skip it.
 pub async fn lock_or_create_wallet(
     conn: &mut PgConnection,
+    account_id: &str,
     tenant_id: &str,
-) -> Result<LockedWallet, sqlx::Error> {
-    if let Some(locked) = lock_wallet(conn, tenant_id).await? {
+    max_tenants: Option<i32>,
+) -> Result<LockedWallet, ApiError> {
+    if let Some(locked) = lock_wallet(conn, account_id, tenant_id).await? {
         return Ok(locked);
     }
-    sqlx::query("INSERT INTO wallets (tenant_id) VALUES ($1) ON CONFLICT (tenant_id) DO NOTHING")
+    if let Some(max) = max_tenants {
+        sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(account_id)
+            .execute(&mut *conn)
+            .await?;
+        let tenants: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wallets WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_one(&mut *conn)
+            .await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM wallets WHERE account_id = $1 AND tenant_id = $2)",
+        )
+        .bind(account_id)
         .bind(tenant_id)
-        .execute(&mut *conn)
+        .fetch_one(&mut *conn)
         .await?;
-    lock_wallet(conn, tenant_id).await?.ok_or(sqlx::Error::RowNotFound)
+        if !exists && tenants >= i64::from(max) {
+            return Err(ApiError::forbidden(
+                "tenant_limit_reached",
+                format!("this account is limited to {max} tenants"),
+            ));
+        }
+    }
+    sqlx::query(
+        "INSERT INTO wallets (account_id, tenant_id) VALUES ($1, $2) \
+         ON CONFLICT (account_id, tenant_id) DO NOTHING",
+    )
+    .bind(account_id)
+    .bind(tenant_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(lock_wallet(conn, account_id, tenant_id).await?.ok_or(sqlx::Error::RowNotFound)?)
 }
 
 /// Non-blocking variant used by the reaper: returns `None` when another
@@ -98,11 +134,14 @@ pub async fn lock_or_create_wallet(
 /// reservation locks (which would invert the lock order and risk deadlock).
 pub async fn try_lock_wallet(
     conn: &mut PgConnection,
+    account_id: &str,
     tenant_id: &str,
 ) -> Result<Option<Wallet>, sqlx::Error> {
     sqlx::query_as::<_, Wallet>(&format!(
-        "SELECT {WALLET_COLUMNS} FROM wallets WHERE tenant_id = $1 FOR UPDATE SKIP LOCKED"
+        "SELECT {WALLET_COLUMNS} FROM wallets \
+         WHERE account_id = $1 AND tenant_id = $2 FOR UPDATE SKIP LOCKED"
     ))
+    .bind(account_id)
     .bind(tenant_id)
     .fetch_optional(conn)
     .await
@@ -110,14 +149,16 @@ pub async fn try_lock_wallet(
 
 async fn read_reservation(
     conn: &mut PgConnection,
-    tenant_id: &str,
+    wallet: &Wallet,
     reservation_id: Uuid,
 ) -> Result<Option<Reservation>, sqlx::Error> {
     sqlx::query_as::<_, Reservation>(&format!(
-        "SELECT {RESERVATION_COLUMNS} FROM reservations WHERE id = $1 AND tenant_id = $2"
+        "SELECT {RESERVATION_COLUMNS} FROM reservations \
+         WHERE id = $1 AND account_id = $2 AND tenant_id = $3"
     ))
     .bind(reservation_id)
-    .bind(tenant_id)
+    .bind(&wallet.account_id)
+    .bind(&wallet.tenant_id)
     .fetch_optional(conn)
     .await
 }
@@ -176,6 +217,7 @@ struct IdempotencyRecord {
 /// locked, then applied by [`WriteSet::flush`] in one round trip.
 #[derive(Debug)]
 pub struct WriteSet {
+    account_id: String,
     tenant_id: String,
     wallet: Option<(i64, i64)>,
     new_reservation: Option<NewReservation>,
@@ -185,8 +227,9 @@ pub struct WriteSet {
 }
 
 impl WriteSet {
-    pub fn new(tenant_id: &str) -> Self {
+    pub fn new(account_id: &str, tenant_id: &str) -> Self {
         Self {
+            account_id: account_id.to_owned(),
             tenant_id: tenant_id.to_owned(),
             wallet: None,
             new_reservation: None,
@@ -269,16 +312,18 @@ impl WriteSet {
             Some(idem) => {
                 qb.push(
                     "INSERT INTO idempotency_keys \
-                       (tenant_id, idempotency_key, endpoint, request_hash, response_status, response_body) \
+                       (account_id, tenant_id, idempotency_key, endpoint, request_hash, \
+                        response_status, response_body) \
                      VALUES (",
                 );
+                qb.push_bind(&self.account_id).push(", ");
                 qb.push_bind(&self.tenant_id).push(", ");
                 qb.push_bind(&idem.key).push(", ");
                 qb.push_bind(idem.endpoint).push(", ");
                 qb.push_bind(&idem.request_hash).push(", ");
                 qb.push_bind(idem.status).push(", ");
                 qb.push_bind(&idem.body);
-                qb.push(") ON CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING 1");
+                qb.push(") ON CONFLICT (account_id, tenant_id, idempotency_key) DO NOTHING RETURNING 1");
             }
             None => {
                 qb.push("SELECT 1");
@@ -289,7 +334,8 @@ impl WriteSet {
         if let Some((available, reserved)) = self.wallet {
             qb.push(", w AS (UPDATE wallets SET available_credits = ");
             qb.push_bind(available).push(", reserved_credits = ");
-            qb.push_bind(reserved).push(", updated_at = NOW() WHERE tenant_id = ");
+            qb.push_bind(reserved).push(", updated_at = NOW() WHERE account_id = ");
+            qb.push_bind(&self.account_id).push(" AND tenant_id = ");
             qb.push_bind(&self.tenant_id);
             qb.push(" AND EXISTS (SELECT 1 FROM gate) RETURNING 1)");
         }
@@ -297,9 +343,11 @@ impl WriteSet {
         if let Some(r) = &self.new_reservation {
             qb.push(
                 ", ri AS (INSERT INTO reservations \
-                   (id, tenant_id, feature, reserved_amount, status, expires_at, metadata) SELECT ",
+                   (id, account_id, tenant_id, feature, reserved_amount, status, expires_at, metadata) \
+                 SELECT ",
             );
             qb.push_bind(r.id).push(", ");
+            qb.push_bind(&self.account_id).push(", ");
             qb.push_bind(&self.tenant_id).push(", ");
             qb.push_bind(&r.feature).push(", ");
             qb.push_bind(r.reserved_amount).push(", 'PENDING', ");
@@ -324,10 +372,11 @@ impl WriteSet {
             let rows = &self.ledger;
             qb.push(
                 ", l AS (INSERT INTO ledger_entries \
-                   (id, tenant_id, reservation_id, entry_type, delta_available, delta_reserved, \
-                    balance_available_after, balance_reserved_after, metadata, created_at) \
+                   (id, account_id, tenant_id, reservation_id, entry_type, delta_available, \
+                    delta_reserved, balance_available_after, balance_reserved_after, metadata, created_at) \
                  SELECT t.id, ",
             );
+            qb.push_bind(&self.account_id).push(", ");
             qb.push_bind(&self.tenant_id);
             // clock_timestamp() plus a per-row microsecond keeps entries from
             // one statement strictly ordered by created_at.
@@ -471,7 +520,7 @@ async fn pending_reservation(
     reservation_id: Uuid,
     source: &str,
 ) -> Result<Result<Reservation, Outcome>, ApiError> {
-    let Some(reservation) = read_reservation(conn, &wallet.tenant_id, reservation_id).await? else {
+    let Some(reservation) = read_reservation(conn, wallet, reservation_id).await? else {
         return Ok(Err(reservation_not_found(reservation_id)));
     };
     if reservation.status != ReservationStatus::Pending.as_str() {
@@ -488,7 +537,7 @@ async fn pending_reservation(
 }
 
 pub fn grant(wallet: &mut Wallet, now: DateTime<Utc>, req: GrantRequest) -> Result<Plan, ApiError> {
-    let mut writes = WriteSet::new(&wallet.tenant_id);
+    let mut writes = WriteSet::new(&wallet.account_id, &wallet.tenant_id);
     if wallet.available_credits.checked_add(req.amount).is_none() {
         let outcome = Outcome::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -522,7 +571,7 @@ pub fn grant(wallet: &mut Wallet, now: DateTime<Utc>, req: GrantRequest) -> Resu
 }
 
 pub fn reserve(wallet: &mut Wallet, now: DateTime<Utc>, req: ReserveRequest) -> Result<Plan, ApiError> {
-    let mut writes = WriteSet::new(&wallet.tenant_id);
+    let mut writes = WriteSet::new(&wallet.account_id, &wallet.tenant_id);
     let estimate = req.estimate_credits;
     if wallet.available_credits < estimate {
         let outcome = Outcome::new(
@@ -574,7 +623,7 @@ pub async fn commit(
     now: DateTime<Utc>,
     req: CommitRequest,
 ) -> Result<Plan, ApiError> {
-    let mut writes = WriteSet::new(&wallet.tenant_id);
+    let mut writes = WriteSet::new(&wallet.account_id, &wallet.tenant_id);
     let reservation =
         match pending_reservation(conn, &mut writes, wallet, now, req.reservation_id, "commit").await? {
             Ok(r) => r,
@@ -668,7 +717,7 @@ pub async fn release(
     now: DateTime<Utc>,
     req: ReleaseRequest,
 ) -> Result<Plan, ApiError> {
-    let mut writes = WriteSet::new(&wallet.tenant_id);
+    let mut writes = WriteSet::new(&wallet.account_id, &wallet.tenant_id);
     let reservation =
         match pending_reservation(conn, &mut writes, wallet, now, req.reservation_id, "release").await? {
             Ok(r) => r,
@@ -711,23 +760,29 @@ pub async fn release(
 
 pub async fn fetch_wallet(
     conn: &mut PgConnection,
+    account_id: &str,
     tenant_id: &str,
 ) -> Result<Option<Wallet>, sqlx::Error> {
-    sqlx::query_as::<_, Wallet>(&format!("SELECT {WALLET_COLUMNS} FROM wallets WHERE tenant_id = $1"))
-        .bind(tenant_id)
-        .fetch_optional(conn)
-        .await
+    sqlx::query_as::<_, Wallet>(&format!(
+        "SELECT {WALLET_COLUMNS} FROM wallets WHERE account_id = $1 AND tenant_id = $2"
+    ))
+    .bind(account_id)
+    .bind(tenant_id)
+    .fetch_optional(conn)
+    .await
 }
 
 pub async fn recent_ledger(
     conn: &mut PgConnection,
+    account_id: &str,
     tenant_id: &str,
     limit: i64,
 ) -> Result<Vec<LedgerEntry>, sqlx::Error> {
     sqlx::query_as::<_, LedgerEntry>(&format!(
-        "SELECT {LEDGER_COLUMNS} FROM ledger_entries WHERE tenant_id = $1 \
-         ORDER BY created_at DESC, id DESC LIMIT $2"
+        "SELECT {LEDGER_COLUMNS} FROM ledger_entries WHERE account_id = $1 AND tenant_id = $2 \
+         ORDER BY created_at DESC, id DESC LIMIT $3"
     ))
+    .bind(account_id)
     .bind(tenant_id)
     .bind(limit)
     .fetch_all(conn)

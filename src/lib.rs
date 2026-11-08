@@ -1,5 +1,7 @@
 //! TokenLedger: atomic usage metering, credit ledger & entitlements API.
 
+pub mod accounts;
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod idempotency;
@@ -8,7 +10,7 @@ pub mod models;
 pub mod reaper;
 pub mod routes;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use sqlx::{PgPool, migrate::Migrator, postgres::PgPoolOptions};
 
@@ -19,11 +21,24 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
+    pub auth: Arc<auth::AuthCache>,
+    pub limiter: Arc<auth::RateLimiter>,
+    pub usage: Arc<auth::UsageMeter>,
 }
 
 impl AppState {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self::with_auth_cache_ttl(pool, auth::DEFAULT_AUTH_CACHE_TTL)
+    }
+
+    /// A zero TTL disables the key cache (every request checks the database).
+    pub fn with_auth_cache_ttl(pool: PgPool, ttl: Duration) -> Self {
+        Self {
+            pool,
+            auth: Arc::new(auth::AuthCache::new(ttl)),
+            limiter: Arc::new(auth::RateLimiter::default()),
+            usage: Arc::new(auth::UsageMeter::default()),
+        }
     }
 }
 

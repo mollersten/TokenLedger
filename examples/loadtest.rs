@@ -188,6 +188,7 @@ impl Rng {
 struct Ctx {
     client: Client,
     url: String,
+    api_key: String,
 }
 
 impl Ctx {
@@ -195,6 +196,7 @@ impl Ctx {
         let res = self
             .client
             .post(format!("{}{path}", self.url))
+            .bearer_auth(&self.api_key)
             .header("Idempotency-Key", key)
             .json(body)
             .send()
@@ -209,6 +211,7 @@ impl Ctx {
         let res = self
             .client
             .get(format!("{}{path}", self.url))
+            .bearer_auth(&self.api_key)
             .send()
             .await
             .map_err(|e| format!("{path}: {e}"))?;
@@ -406,16 +409,32 @@ async fn main() {
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap();
-    let ctx = Arc::new(Ctx { client, url: args.url.clone() });
+    let run_id = Uuid::new_v4().simple().to_string()[..8].to_owned();
+    let prefix = format!("lt_{run_id}_");
 
+    // The run gets its own unlimited account and API key, created directly in
+    // the database the server uses.
+    let _ = dotenvy::dotenv();
+    let db_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB_URL.to_owned());
+    let pool = backend::connect(&db_url, 2).await.expect("connect to the database");
+    let account = backend::accounts::create_account(
+        &pool,
+        &backend::accounts::NewAccount::unlimited(format!("loadtest {run_id}")),
+    )
+    .await
+    .expect("create load-test account (has the server applied its migrations?)");
+    let key = backend::accounts::issue_key(&pool, &account.id, Some("loadtest")).await.unwrap();
+
+    let ctx = Arc::new(Ctx { client, url: args.url.clone(), api_key: key.secret });
     match ctx.get("/healthz").await {
         Ok((StatusCode::OK, _)) => {}
         other => panic!("server not healthy at {}: {other:?}", args.url),
     }
 
-    let run_id = &Uuid::new_v4().simple().to_string()[..8];
-    let prefix = format!("lt_{run_id}_");
-    println!("TokenLedger load test  run={run_id}  url={}  duration={:?}/scenario", args.url, args.duration);
+    println!(
+        "TokenLedger load test  run={run_id}  account={}  url={}  duration={:?}/scenario",
+        account.id, args.url, args.duration
+    );
     let fixture = seed(&ctx, &prefix, args.tenants).await;
 
     let mut totals: BTreeMap<&'static str, u64> = BTreeMap::new();
@@ -442,7 +461,7 @@ async fn main() {
         println!();
     }
 
-    verify(&ctx, &fixture, &prefix, &totals, args.tenants + 2).await;
+    verify(&ctx, &pool, &account.id, &fixture, &prefix, &totals, args.tenants + 2).await;
     if total_errors > 0 {
         println!("FAILED: {total_errors} request errors");
         std::process::exit(1);
@@ -453,6 +472,8 @@ async fn main() {
 /// that the number of ledger entries matches the number of 200 responses.
 async fn verify(
     ctx: &Ctx,
+    pool: &sqlx::PgPool,
+    account_id: &str,
     fixture: &Fixture,
     prefix: &str,
     totals: &BTreeMap<&'static str, u64>,
@@ -476,10 +497,6 @@ async fn verify(
     assert_eq!(status, StatusCode::OK);
     assert_eq!(fixture.replay_tenant, replay_id);
 
-    let _ = dotenvy::dotenv();
-    let db_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB_URL.to_owned());
-    let pool = backend::connect(&db_url, 2).await.expect("connect for verification");
-
     let (wallets, mismatched, negative): (i64, i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), \
                 COUNT(*) FILTER (WHERE w.available_credits <> COALESCE(l.sa, 0) \
@@ -487,28 +504,34 @@ async fn verify(
                 COUNT(*) FILTER (WHERE w.available_credits < 0 OR w.reserved_credits < 0) \
          FROM wallets w \
          LEFT JOIN (SELECT tenant_id, SUM(delta_available)::bigint sa, SUM(delta_reserved)::bigint sr \
-                    FROM ledger_entries WHERE starts_with(tenant_id, $1) GROUP BY tenant_id) l \
+                    FROM ledger_entries WHERE account_id = $2 AND starts_with(tenant_id, $1) \
+                    GROUP BY tenant_id) l \
            USING (tenant_id) \
-         WHERE starts_with(w.tenant_id, $1)",
+         WHERE w.account_id = $2 AND starts_with(w.tenant_id, $1)",
     )
     .bind(prefix)
-    .fetch_one(&pool)
+    .bind(account_id)
+    .fetch_one(pool)
     .await
     .unwrap();
 
     let entries: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT entry_type, COUNT(*) FROM ledger_entries WHERE starts_with(tenant_id, $1) GROUP BY 1",
+        "SELECT entry_type, COUNT(*) FROM ledger_entries \
+         WHERE account_id = $2 AND starts_with(tenant_id, $1) GROUP BY 1",
     )
     .bind(prefix)
-    .fetch_all(&pool)
+    .bind(account_id)
+    .fetch_all(pool)
     .await
     .unwrap();
     let entries: BTreeMap<String, i64> = entries.into_iter().collect();
     let pending: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM reservations WHERE starts_with(tenant_id, $1) AND status = 'PENDING'",
+        "SELECT COUNT(*) FROM reservations \
+         WHERE account_id = $2 AND starts_with(tenant_id, $1) AND status = 'PENDING'",
     )
     .bind(prefix)
-    .fetch_one(&pool)
+    .bind(account_id)
+    .fetch_one(pool)
     .await
     .unwrap();
 

@@ -1,11 +1,16 @@
 //! HTTP layer: request parsing, the idempotent transaction envelope shared by
-//! every mutating endpoint, and the read-only wallet endpoint.
+//! every mutating endpoint, and the read-only wallet endpoint. Every `/v1`
+//! route runs behind [`auth::require_api_key`]; all data access is scoped to
+//! the caller's account.
+
+use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::{Path, State},
     http::HeaderMap,
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -14,6 +19,7 @@ use serde_json::{Value, json};
 
 use crate::{
     AppState,
+    auth::{self, AuthContext},
     error::ApiError,
     idempotency, ledger,
     models::{CommitRequest, GrantRequest, ReleaseRequest, ReserveRequest, validate_tenant_id},
@@ -22,15 +28,20 @@ use crate::{
 const RECENT_LEDGER_LIMIT: i64 = 20;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let v1 = Router::new()
         .route("/v1/credits/grant", post(grant))
         .route("/v1/credits/reserve", post(reserve))
         .route("/v1/credits/commit", post(commit))
         .route("/v1/credits/release", post(release))
         .route("/v1/tenants/{tenant_id}/wallet", get(get_wallet))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_api_key));
+    Router::new()
+        .merge(v1)
         .route("/healthz", get(health))
         .with_state(state)
 }
+
+type Caller = Extension<Arc<AuthContext>>;
 
 // ---------------------------------------------------------------------------
 // Mutations
@@ -97,7 +108,8 @@ impl Mutation {
 ///
 /// 1. Validate `Idempotency-Key` and the body (failures are not cached).
 /// 2. Fast path: replay a stored response without taking any lock.
-/// 3. `BEGIN`, lock the wallet row `FOR UPDATE` (grant creates it if needed).
+/// 3. `BEGIN`, lock the wallet row `FOR UPDATE` (grant creates it if needed,
+///    subject to the account's tenant limit).
 /// 4. Decide the outcome and its writes in memory (commit/release read the
 ///    reservation first).
 /// 5. Flush all writes plus the idempotency record in one statement, gated
@@ -106,6 +118,7 @@ impl Mutation {
 ///    response is replayed instead. Otherwise `COMMIT`.
 async fn execute(
     state: &AppState,
+    caller: &AuthContext,
     headers: &HeaderMap,
     body: &[u8],
     endpoint: Endpoint,
@@ -115,16 +128,19 @@ async fn execute(
         .map_err(|e| ApiError::bad_request("invalid_json", format!("request body is not valid JSON: {e}")))?;
     let hash = idempotency::request_hash(&value);
     let mutation = Mutation::parse(endpoint, value)?;
+    let account_id = caller.account_id.as_str();
     let tenant_id = mutation.tenant_id().to_owned();
 
-    if let Some(stored) = idempotency::lookup(&state.pool, &tenant_id, &key).await? {
+    if let Some(stored) = idempotency::lookup(&state.pool, account_id, &tenant_id, &key).await? {
         return idempotency::replay(stored, endpoint.path(), &hash);
     }
 
     let mut tx = state.pool.begin().await?;
     let locked = match &mutation {
-        Mutation::Grant(_) => Some(ledger::lock_or_create_wallet(&mut tx, &tenant_id).await?),
-        _ => ledger::lock_wallet(&mut tx, &tenant_id).await?,
+        Mutation::Grant(_) => Some(
+            ledger::lock_or_create_wallet(&mut tx, account_id, &tenant_id, caller.max_tenants).await?,
+        ),
+        _ => ledger::lock_wallet(&mut tx, account_id, &tenant_id).await?,
     };
     let Some(ledger::LockedWallet { mut wallet, now }) = locked else {
         tx.rollback().await?;
@@ -141,7 +157,7 @@ async fn execute(
     writes.record_idempotency(&key, endpoint.path(), &hash, &outcome);
     if !writes.flush(&mut tx).await? {
         tx.rollback().await?;
-        let stored = idempotency::lookup(&state.pool, &tenant_id, &key)
+        let stored = idempotency::lookup(&state.pool, account_id, &tenant_id, &key)
             .await?
             .ok_or_else(|| ApiError::internal("idempotency key conflicted but no stored response was found"))?;
         return idempotency::replay(stored, endpoint.path(), &hash);
@@ -151,20 +167,40 @@ async fn execute(
     Ok((outcome.status, Json(outcome.body)).into_response())
 }
 
-async fn grant(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
-    execute(&state, &headers, &body, Endpoint::Grant).await
+async fn grant(
+    State(state): State<AppState>,
+    Extension(caller): Caller,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    execute(&state, &caller, &headers, &body, Endpoint::Grant).await
 }
 
-async fn reserve(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
-    execute(&state, &headers, &body, Endpoint::Reserve).await
+async fn reserve(
+    State(state): State<AppState>,
+    Extension(caller): Caller,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    execute(&state, &caller, &headers, &body, Endpoint::Reserve).await
 }
 
-async fn commit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
-    execute(&state, &headers, &body, Endpoint::Commit).await
+async fn commit(
+    State(state): State<AppState>,
+    Extension(caller): Caller,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    execute(&state, &caller, &headers, &body, Endpoint::Commit).await
 }
 
-async fn release(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
-    execute(&state, &headers, &body, Endpoint::Release).await
+async fn release(
+    State(state): State<AppState>,
+    Extension(caller): Caller,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    execute(&state, &caller, &headers, &body, Endpoint::Release).await
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +209,7 @@ async fn release(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
 
 async fn get_wallet(
     State(state): State<AppState>,
+    Extension(caller): Caller,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     validate_tenant_id(&tenant_id)?;
@@ -181,11 +218,11 @@ async fn get_wallet(
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *tx)
         .await?;
-    let Some(wallet) = ledger::fetch_wallet(&mut tx, &tenant_id).await? else {
+    let Some(wallet) = ledger::fetch_wallet(&mut tx, &caller.account_id, &tenant_id).await? else {
         tx.rollback().await?;
         return Err(ApiError::wallet_not_found(&tenant_id));
     };
-    let recent = ledger::recent_ledger(&mut tx, &tenant_id, RECENT_LEDGER_LIMIT).await?;
+    let recent = ledger::recent_ledger(&mut tx, &caller.account_id, &tenant_id, RECENT_LEDGER_LIMIT).await?;
     tx.commit().await?;
 
     Ok(Json(json!({

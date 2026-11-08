@@ -19,6 +19,7 @@ const MAX_REASON_LEN: usize = 1_024;
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
 pub struct Wallet {
+    pub account_id: String,
     pub tenant_id: String,
     pub available_credits: i64,
     pub reserved_credits: i64,
@@ -28,6 +29,7 @@ pub struct Wallet {
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
 pub struct Reservation {
     pub id: Uuid,
+    pub account_id: String,
     pub tenant_id: String,
     pub feature: String,
     pub reserved_amount: i64,
@@ -53,9 +55,10 @@ pub struct LedgerEntry {
     pub created_at: DateTime<Utc>,
 }
 
-pub const WALLET_COLUMNS: &str = "tenant_id, available_credits, reserved_credits, updated_at";
-pub const RESERVATION_COLUMNS: &str = "id, tenant_id, feature, reserved_amount, committed_amount, \
-     status, expires_at, metadata, created_at, updated_at";
+pub const WALLET_COLUMNS: &str =
+    "account_id, tenant_id, available_credits, reserved_credits, updated_at";
+pub const RESERVATION_COLUMNS: &str = "id, account_id, tenant_id, feature, reserved_amount, \
+     committed_amount, status, expires_at, metadata, created_at, updated_at";
 pub const LEDGER_COLUMNS: &str = "id, tenant_id, reservation_id, entry_type, delta_available, \
      delta_reserved, balance_available_after, balance_reserved_after, metadata, created_at";
 

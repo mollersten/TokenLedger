@@ -89,11 +89,11 @@ async fn concurrent_commits_on_one_reservation_settle_once() {
     let barrier = Arc::new(Barrier::new(TASKS));
     let mut handles = Vec::new();
     for _ in 0..TASKS {
-        let (router, barrier, tenant) = (app.router.clone(), barrier.clone(), tenant.clone());
+        let (router, barrier, tenant) = (app.api.clone(), barrier.clone(), tenant.clone());
         handles.push(tokio::spawn(async move {
             let body = json!({ "tenant_id": tenant, "reservation_id": id, "actual_credits_used": 3 });
             barrier.wait().await;
-            post(router, "/v1/credits/commit", &new_key(), body).await
+            post(&router, "/v1/credits/commit", &new_key(), body).await
         }));
     }
     let mut statuses = Vec::new();
@@ -115,10 +115,10 @@ async fn concurrent_first_grants_create_one_wallet() {
     let barrier = Arc::new(Barrier::new(TASKS));
     let mut handles = Vec::new();
     for _ in 0..TASKS {
-        let (router, barrier, tenant) = (app.router.clone(), barrier.clone(), tenant.clone());
+        let (router, barrier, tenant) = (app.api.clone(), barrier.clone(), tenant.clone());
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
-            post(router, "/v1/credits/grant", &new_key(), json!({ "tenant_id": tenant, "amount": 7 })).await
+            post(&router, "/v1/credits/grant", &new_key(), json!({ "tenant_id": tenant, "amount": 7 })).await
         }));
     }
     for h in handles {
@@ -138,18 +138,13 @@ async fn duplicate_queued_behind_lock_replays_via_gate() {
     let tenant = unique_tenant("cus_gate");
     app.grant(&tenant, 100).await;
 
-    let mut holder = app.pool.begin().await.unwrap();
-    sqlx::query("SELECT 1 FROM wallets WHERE tenant_id = $1 FOR UPDATE")
-        .bind(&tenant)
-        .execute(&mut *holder)
-        .await
-        .unwrap();
+    let holder = app.hold_wallet_lock(&tenant).await;
 
     let key = new_key();
     let body = json!({ "tenant_id": tenant, "feature": "gate", "estimate_credits": 10, "ttl_seconds": 300 });
     let spawn_reserve = || {
-        let (router, key, body) = (app.router.clone(), key.clone(), body.clone());
-        tokio::spawn(async move { post(router, "/v1/credits/reserve", &key, body).await })
+        let (router, key, body) = (app.api.clone(), key.clone(), body.clone());
+        tokio::spawn(async move { post(&router, "/v1/credits/reserve", &key, body).await })
     };
     let (first, second) = (spawn_reserve(), spawn_reserve());
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -191,12 +186,7 @@ async fn reaper_skips_busy_wallets_instead_of_waiting() {
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
     // Simulate an in-flight request holding the wallet lock.
-    let mut holder = app.pool.begin().await.unwrap();
-    sqlx::query("SELECT 1 FROM wallets WHERE tenant_id = $1 FOR UPDATE")
-        .bind(&tenant)
-        .execute(&mut *holder)
-        .await
-        .unwrap();
+    let holder = app.hold_wallet_lock(&tenant).await;
 
     let pass = tokio::time::timeout(Duration::from_secs(5), reaper::run_once(&app.pool, reaper::BATCH_SIZE))
         .await
@@ -223,7 +213,7 @@ async fn request_validation_and_not_found() {
     let tenant = unique_tenant("cus_validation");
 
     let missing_key = send(
-        app.router.clone(),
+        &app.api,
         Method::POST,
         "/v1/credits/grant",
         None,
