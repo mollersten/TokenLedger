@@ -11,6 +11,8 @@
 //!   --duration SECS         per scenario                (default 10)
 //!   --tenants N             wallets for spread-out load (default 1000)
 //!   --scenario NAME[,..]    grant, reserve-commit, hot-tenant, replay, read, or all (default all)
+//!   --expiring              also fund every wallet with two expiring credit
+//!                           buckets, so every reserve spends from buckets
 //!
 //! Every request carries a fresh Idempotency-Key (except `replay`, which
 //! deliberately reuses one). After the run, every wallet the test touched is
@@ -70,6 +72,7 @@ struct Args {
     duration: Duration,
     tenants: usize,
     scenarios: Vec<Scenario>,
+    expiring: bool,
 }
 
 fn parse_args() -> Args {
@@ -79,6 +82,7 @@ fn parse_args() -> Args {
         duration: Duration::from_secs(10),
         tenants: 1000,
         scenarios: Scenario::ALL.to_vec(),
+        expiring: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -104,6 +108,7 @@ fn parse_args() -> Args {
                         .collect();
                 }
             }
+            "--expiring" => args.expiring = true,
             "-h" | "--help" => {
                 println!("see the doc comment at the top of examples/loadtest.rs");
                 std::process::exit(0);
@@ -225,10 +230,12 @@ fn key() -> String {
     Uuid::new_v4().to_string()
 }
 
-async fn grant(ctx: &Ctx, tenant: &str, amount: i64) -> Result<(), String> {
-    let (status, body) = ctx
-        .post("/v1/credits/grant", &key(), &json!({ "tenant_id": tenant, "amount": amount, "reason": "loadtest" }))
-        .await?;
+async fn grant(ctx: &Ctx, tenant: &str, amount: i64, expires_at: Option<&str>) -> Result<(), String> {
+    let mut body = json!({ "tenant_id": tenant, "amount": amount, "reason": "loadtest" });
+    if let Some(at) = expires_at {
+        body["expires_at"] = json!(at);
+    }
+    let (status, body) = ctx.post("/v1/credits/grant", &key(), &body).await?;
     if status != StatusCode::OK {
         return Err(format!("grant {status}: {body}"));
     }
@@ -280,7 +287,13 @@ struct Fixture {
     replay_body: Value,
 }
 
-async fn seed(ctx: &Arc<Ctx>, prefix: &str, count: usize) -> Fixture {
+/// Grants per seeded wallet: a permanent top-up, plus two expiring buckets
+/// (30 and 60 days out) with `--expiring`.
+fn seed_grants(expiring: bool) -> usize {
+    if expiring { 3 } else { 1 }
+}
+
+async fn seed(ctx: &Arc<Ctx>, prefix: &str, count: usize, expiring: bool) -> Fixture {
     let tenants: Vec<String> = (0..count).map(|i| format!("{prefix}{i:05}")).collect();
     let all: Vec<String> = tenants
         .iter()
@@ -289,12 +302,22 @@ async fn seed(ctx: &Arc<Ctx>, prefix: &str, count: usize) -> Fixture {
         .collect();
     let started = Instant::now();
     let chunks: Vec<Vec<String>> = all.chunks(all.len().div_ceil(32)).map(<[String]>::to_vec).collect();
+    let now = chrono::Utc::now();
+    let bucket_expiries: Arc<Vec<String>> = Arc::new(if expiring {
+        [30, 60].map(|days| (now + chrono::Duration::days(days)).to_rfc3339()).to_vec()
+    } else {
+        Vec::new()
+    });
     let mut handles = Vec::new();
     for chunk in chunks {
         let ctx = ctx.clone();
+        let bucket_expiries = bucket_expiries.clone();
         handles.push(tokio::spawn(async move {
             for t in chunk {
-                grant(&ctx, &t, SEED_BALANCE).await.expect("seeding failed");
+                grant(&ctx, &t, SEED_BALANCE, None).await.expect("seeding failed");
+                for at in bucket_expiries.iter() {
+                    grant(&ctx, &t, SEED_BALANCE, Some(at)).await.expect("seeding failed");
+                }
             }
         }));
     }
@@ -347,7 +370,7 @@ async fn run_scenario(
                     Scenario::Grant => {
                         let t = &tenants[rng.below(tenants.len())];
                         let s = Instant::now();
-                        match grant(&ctx, t, 1).await {
+                        match grant(&ctx, t, 1, None).await {
                             Ok(()) => stats.record("grant", s),
                             Err(e) => stats.error(e),
                         }
@@ -435,7 +458,7 @@ async fn main() {
         "TokenLedger load test  run={run_id}  account={}  url={}  duration={:?}/scenario",
         account.id, args.url, args.duration
     );
-    let fixture = seed(&ctx, &prefix, args.tenants).await;
+    let fixture = seed(&ctx, &prefix, args.tenants, args.expiring).await;
 
     let mut totals: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut total_errors = 0;
@@ -461,7 +484,8 @@ async fn main() {
         println!();
     }
 
-    verify(&ctx, &pool, &account.id, &fixture, &prefix, &totals, args.tenants + 2).await;
+    let seeded_grants = (args.tenants + 2) * seed_grants(args.expiring);
+    verify(&ctx, &pool, &account.id, &fixture, &prefix, &totals, seeded_grants).await;
     if total_errors > 0 {
         println!("FAILED: {total_errors} request errors");
         std::process::exit(1);
@@ -477,7 +501,7 @@ async fn verify(
     fixture: &Fixture,
     prefix: &str,
     totals: &BTreeMap<&'static str, u64>,
-    seeded: usize,
+    seeded_grants: usize,
 ) {
     // Settle the replay fixture so no hold is left behind.
     let replay_id = fixture.replay_body["tenant_id"].as_str().unwrap();
@@ -515,6 +539,20 @@ async fn verify(
     .await
     .unwrap();
 
+    let bucket_mismatched: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM wallets w \
+         LEFT JOIN (SELECT tenant_id, SUM(remaining)::bigint s FROM credit_buckets \
+                    WHERE account_id = $2 AND starts_with(tenant_id, $1) GROUP BY tenant_id) b \
+           USING (tenant_id) \
+         WHERE w.account_id = $2 AND starts_with(w.tenant_id, $1) \
+           AND w.expiring_credits <> COALESCE(b.s, 0)",
+    )
+    .bind(prefix)
+    .bind(account_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
     let entries: Vec<(String, i64)> = sqlx::query_as(
         "SELECT entry_type, COUNT(*) FROM ledger_entries \
          WHERE account_id = $2 AND starts_with(tenant_id, $1) GROUP BY 1",
@@ -538,7 +576,7 @@ async fn verify(
     let get = |m: &BTreeMap<String, i64>, k: &str| m.get(k).copied().unwrap_or(0) as u64;
     let ok = |k: &str| totals.get(k).copied().unwrap_or(0);
     // +1 RESERVE and +1 COMMIT for the replay fixture, +seeded GRANTs.
-    let expected_grants = ok("grant") + seeded as u64;
+    let expected_grants = ok("grant") + seeded_grants as u64;
     let expected_reserves = ok("reserve") + 1;
     let expected_commits = ok("commit") + 1;
 
@@ -546,6 +584,7 @@ async fn verify(
     println!("  wallets checked            {wallets}");
     println!("  wallet != SUM(ledger)      {mismatched}");
     println!("  negative balances          {negative}");
+    println!("  expiring != SUM(buckets)   {bucket_mismatched}");
     println!("  pending reservations left  {pending}");
     println!(
         "  GRANT entries   {:>9}  (expected {expected_grants})",
@@ -560,6 +599,7 @@ async fn verify(
         get(&entries, "COMMIT")
     );
     let consistent = mismatched == 0
+        && bucket_mismatched == 0
         && negative == 0
         && pending == 0
         && get(&entries, "GRANT") == expected_grants

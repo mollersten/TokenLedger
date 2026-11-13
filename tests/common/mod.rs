@@ -11,6 +11,7 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use axum::{
     Router,
     body::Body,
@@ -171,6 +172,27 @@ impl TestApp {
         res
     }
 
+    /// Grant credits that expire at `expires_at`; returns the bucket id.
+    pub async fn grant_expiring(&self, tenant: &str, amount: i64, expires_at: DateTime<Utc>) -> Uuid {
+        let res = self
+            .post(
+                "/v1/credits/grant",
+                &new_key(),
+                json!({
+                    "tenant_id": tenant,
+                    "amount": amount,
+                    "reason": "monthly_allowance",
+                    "expires_at": expires_at.to_rfc3339(),
+                }),
+            )
+            .await;
+        assert_eq!(res.status, StatusCode::OK, "expiring grant failed: {}", res.body);
+        res.body["bucket_id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("no bucket_id in {}", res.body))
+    }
+
     pub async fn reserve(&self, tenant: &str, estimate: i64, ttl_seconds: i64) -> TestResponse {
         self.post(
             "/v1/credits/reserve",
@@ -224,6 +246,83 @@ impl TestApp {
     /// (available_credits, reserved_credits) straight from the database.
     pub async fn balances(&self, tenant: &str) -> (i64, i64) {
         balances(&self.pool, &self.account_id, tenant).await
+    }
+
+    /// (available, reserved, expiring) straight from the database.
+    pub async fn wallet_state(&self, tenant: &str) -> (i64, i64, i64) {
+        sqlx::query_as(
+            "SELECT available_credits, reserved_credits, expiring_credits FROM wallets \
+             WHERE account_id = $1 AND tenant_id = $2",
+        )
+        .bind(&self.account_id)
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await
+        .expect("wallet row missing")
+    }
+
+    /// A bucket's `remaining` credits.
+    pub async fn bucket_remaining(&self, bucket_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT remaining FROM credit_buckets WHERE id = $1")
+            .bind(bucket_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("bucket row missing")
+    }
+
+    /// Every credit granted into a bucket is accounted for:
+    /// granted = remaining + held by pending reservations + consumed
+    /// (COMMIT/OVERAGE_DEDUCT) + expired (CREDIT_EXPIRE). The wallet's
+    /// `expiring_credits` and `next_expiry_at` match its buckets.
+    pub async fn assert_buckets_reconcile(&self, tenant: &str) {
+        let rows: Vec<(Uuid, i64, i64, i64, i64, i64)> = sqlx::query_as(
+            "WITH consumed AS ( \
+               SELECT (x->>'bucket_id')::uuid AS id, SUM((x->>'amount')::bigint)::bigint AS amount \
+               FROM ledger_entries l, jsonb_array_elements(l.metadata->'buckets') x \
+               WHERE l.account_id = $1 AND l.tenant_id = $2 \
+                 AND l.entry_type IN ('COMMIT', 'OVERAGE_DEDUCT') GROUP BY 1), \
+             expired AS ( \
+               SELECT bucket_id AS id, SUM(-delta_available)::bigint AS amount FROM ledger_entries \
+               WHERE account_id = $1 AND tenant_id = $2 AND entry_type = 'CREDIT_EXPIRE' GROUP BY 1), \
+             held AS ( \
+               SELECT (x->>'bucket_id')::uuid AS id, SUM((x->>'amount')::bigint)::bigint AS amount \
+               FROM reservations r, jsonb_array_elements(r.bucket_holds) x \
+               WHERE r.account_id = $1 AND r.tenant_id = $2 AND r.status = 'PENDING' GROUP BY 1) \
+             SELECT b.id, b.granted, b.remaining, COALESCE(h.amount, 0), COALESCE(c.amount, 0), \
+                    COALESCE(e.amount, 0) \
+             FROM credit_buckets b \
+             LEFT JOIN held h ON h.id = b.id LEFT JOIN consumed c ON c.id = b.id \
+             LEFT JOIN expired e ON e.id = b.id \
+             WHERE b.account_id = $1 AND b.tenant_id = $2",
+        )
+        .bind(&self.account_id)
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        for (id, granted, remaining, held, consumed, expired) in &rows {
+            assert_eq!(
+                *granted,
+                remaining + held + consumed + expired,
+                "bucket {id}: granted {granted} != remaining {remaining} + held {held} + consumed {consumed} + expired {expired}"
+            );
+        }
+        let (expiring, next_expiry, sum, min_expiry): (i64, Option<DateTime<Utc>>, i64, Option<DateTime<Utc>>) =
+            sqlx::query_as(
+                "SELECT w.expiring_credits, w.next_expiry_at, \
+                        COALESCE((SELECT SUM(remaining) FROM credit_buckets b \
+                          WHERE b.account_id = w.account_id AND b.tenant_id = w.tenant_id), 0)::bigint, \
+                        (SELECT MIN(expires_at) FROM credit_buckets b \
+                          WHERE b.account_id = w.account_id AND b.tenant_id = w.tenant_id AND remaining > 0) \
+                 FROM wallets w WHERE w.account_id = $1 AND w.tenant_id = $2",
+            )
+            .bind(&self.account_id)
+            .bind(tenant)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+        assert_eq!(expiring, sum, "expiring_credits must equal the buckets' remaining credits");
+        assert_eq!(next_expiry, min_expiry, "next_expiry_at must be the earliest live bucket's expiry");
     }
 
     /// (status, committed_amount) of a reservation.

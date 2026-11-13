@@ -56,6 +56,15 @@ enum Endpoint {
 }
 
 impl Endpoint {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Grant => "grant",
+            Self::Reserve => "reserve",
+            Self::Commit => "commit",
+            Self::Release => "release",
+        }
+    }
+
     fn path(self) -> &'static str {
         match self {
             Self::Grant => "/v1/credits/grant",
@@ -109,9 +118,11 @@ impl Mutation {
 /// 1. Validate `Idempotency-Key` and the body (failures are not cached).
 /// 2. Fast path: replay a stored response without taking any lock.
 /// 3. `BEGIN`, lock the wallet row `FOR UPDATE` (grant creates it if needed,
-///    subject to the account's tenant limit).
+///    subject to the account's tenant limit), and expire any credit bucket
+///    that is past its expiry.
 /// 4. Decide the outcome and its writes in memory (commit/release read the
-///    reservation first).
+///    reservation first; spending from a wallet with expiring credits reads
+///    its buckets).
 /// 5. Flush all writes plus the idempotency record in one statement, gated
 ///    on the idempotency insert: if a duplicate with the same key committed
 ///    while we waited for the lock, nothing is written and its stored
@@ -142,20 +153,21 @@ async fn execute(
         ),
         _ => ledger::lock_wallet(&mut tx, account_id, &tenant_id).await?,
     };
-    let Some(ledger::LockedWallet { mut wallet, now }) = locked else {
+    let Some(locked) = locked else {
         tx.rollback().await?;
         return Err(ApiError::wallet_not_found(&tenant_id));
     };
 
-    let ledger::Plan { outcome, mut writes } = match mutation {
-        Mutation::Grant(req) => ledger::grant(&mut wallet, now, req)?,
-        Mutation::Reserve(req) => ledger::reserve(&mut wallet, now, req)?,
-        Mutation::Commit(req) => ledger::commit(&mut tx, &mut wallet, now, req).await?,
-        Mutation::Release(req) => ledger::release(&mut tx, &mut wallet, now, req).await?,
+    let mut op = ledger::Op::begin(&mut tx, locked, endpoint.name()).await?;
+    let outcome = match mutation {
+        Mutation::Grant(req) => ledger::grant(&mut op, req)?,
+        Mutation::Reserve(req) => ledger::reserve(&mut tx, &mut op, req).await?,
+        Mutation::Commit(req) => ledger::commit(&mut tx, &mut op, req).await?,
+        Mutation::Release(req) => ledger::release(&mut tx, &mut op, req).await?,
     };
 
-    writes.record_idempotency(&key, endpoint.path(), &hash, &outcome);
-    if !writes.flush(&mut tx).await? {
+    op.record_idempotency(&key, endpoint.path(), &hash, &outcome);
+    if !op.flush(&mut tx).await? {
         tx.rollback().await?;
         let stored = idempotency::lookup(&state.pool, account_id, &tenant_id, &key)
             .await?
@@ -222,13 +234,26 @@ async fn get_wallet(
         tx.rollback().await?;
         return Err(ApiError::wallet_not_found(&tenant_id));
     };
+    let buckets = if wallet.expiring_credits > 0 {
+        ledger::live_buckets(&mut tx, &caller.account_id, &tenant_id).await?
+    } else {
+        Vec::new()
+    };
     let recent = ledger::recent_ledger(&mut tx, &caller.account_id, &tenant_id, RECENT_LEDGER_LIMIT).await?;
     tx.commit().await?;
 
+    // Credits past their expiry are left out even if no request or reaper
+    // pass has written their CREDIT_EXPIRE entry yet.
+    let due: i64 = buckets.iter().filter(|b| b.due).map(|b| b.bucket.remaining).sum();
+    let live: Vec<_> = buckets.into_iter().filter(|b| !b.due).map(|b| b.bucket).collect();
     Ok(Json(json!({
         "tenant_id": wallet.tenant_id,
-        "available_credits": wallet.available_credits,
+        "available_credits": wallet.available_credits - due,
         "reserved_credits": wallet.reserved_credits,
+        "expiring_credits": wallet.expiring_credits - due,
+        "permanent_credits": wallet.permanent_credits(),
+        "next_expiry_at": live.first().map(|b| b.expires_at),
+        "credit_buckets": live,
         "updated_at": wallet.updated_at,
         "recent_ledger": recent,
     })))

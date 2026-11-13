@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sqlx::types::Json;
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -23,7 +24,18 @@ pub struct Wallet {
     pub tenant_id: String,
     pub available_credits: i64,
     pub reserved_credits: i64,
+    /// The part of `available_credits` held in expiring buckets.
+    pub expiring_credits: i64,
+    /// Earliest `expires_at` among buckets with credits left.
+    pub next_expiry_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Wallet {
+    /// Credits that never expire.
+    pub fn permanent_credits(&self) -> i64 {
+        self.available_credits - self.expiring_credits
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
@@ -37,8 +49,29 @@ pub struct Reservation {
     pub status: String,
     pub expires_at: DateTime<Utc>,
     pub metadata: Value,
+    /// Which buckets funded the hold; the rest came from permanent credits.
+    pub bucket_holds: Json<Vec<BucketHold>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Part of a reservation's hold taken from one credit bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketHold {
+    pub bucket_id: Uuid,
+    pub amount: i64,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// A bucket of expiring credits, as listed by the wallet endpoint.
+#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
+pub struct CreditBucket {
+    pub id: Uuid,
+    pub granted: i64,
+    pub remaining: i64,
+    pub expires_at: DateTime<Utc>,
+    pub reason: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
@@ -46,6 +79,7 @@ pub struct LedgerEntry {
     pub id: Uuid,
     pub tenant_id: String,
     pub reservation_id: Option<Uuid>,
+    pub bucket_id: Option<Uuid>,
     pub entry_type: String,
     pub delta_available: i64,
     pub delta_reserved: i64,
@@ -55,12 +89,13 @@ pub struct LedgerEntry {
     pub created_at: DateTime<Utc>,
 }
 
-pub const WALLET_COLUMNS: &str =
-    "account_id, tenant_id, available_credits, reserved_credits, updated_at";
+pub const WALLET_COLUMNS: &str = "account_id, tenant_id, available_credits, reserved_credits, \
+     expiring_credits, next_expiry_at, updated_at";
 pub const RESERVATION_COLUMNS: &str = "id, account_id, tenant_id, feature, reserved_amount, \
-     committed_amount, status, expires_at, metadata, created_at, updated_at";
-pub const LEDGER_COLUMNS: &str = "id, tenant_id, reservation_id, entry_type, delta_available, \
-     delta_reserved, balance_available_after, balance_reserved_after, metadata, created_at";
+     committed_amount, status, expires_at, metadata, bucket_holds, created_at, updated_at";
+pub const LEDGER_COLUMNS: &str = "id, tenant_id, reservation_id, bucket_id, entry_type, \
+     delta_available, delta_reserved, balance_available_after, balance_reserved_after, metadata, \
+     created_at";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReservationStatus {
@@ -90,6 +125,7 @@ pub enum EntryType {
     OverageDeduct,
     Release,
     Expire,
+    CreditExpire,
 }
 
 impl EntryType {
@@ -102,6 +138,7 @@ impl EntryType {
             Self::OverageDeduct => "OVERAGE_DEDUCT",
             Self::Release => "RELEASE",
             Self::Expire => "EXPIRE",
+            Self::CreditExpire => "CREDIT_EXPIRE",
         }
     }
 }
@@ -118,6 +155,10 @@ pub struct GrantRequest {
     pub reason: Option<String>,
     #[serde(default)]
     pub metadata: Option<Map<String, Value>>,
+    /// When set, the credits go into a bucket that expires at this time
+    /// (RFC 3339) instead of the permanent balance.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

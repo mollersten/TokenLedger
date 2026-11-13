@@ -8,7 +8,7 @@
 //! response that belongs to a different request.
 //!
 //! The response row is inserted by the same statement that applies the
-//! balance change (`ledger::WriteSet::flush`), while the tenant's wallet row
+//! balance change (`ledger::Op::flush`), while the tenant's wallet row
 //! is locked. That insert uses `ON CONFLICT DO NOTHING` and gates every other
 //! write, so concurrent requests carrying the same key serialise on the lock,
 //! the first one executes, and the rest write nothing and replay its response.
