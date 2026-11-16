@@ -6,10 +6,13 @@ mod common;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use axum::http::{Method, StatusCode};
-use backend::reaper;
+use backend::{accounts::NewAccount, reaper};
+use chrono::{Duration as ChronoDuration, Utc};
 use common::{TestApp, new_key, post, reservation_id, send, unique_tenant};
 use serde_json::json;
+use sqlx::PgPool;
 use tokio::sync::Barrier;
+use uuid::Uuid;
 
 #[tokio::test]
 async fn release_returns_the_full_hold() {
@@ -205,6 +208,237 @@ async fn reaper_skips_busy_wallets_instead_of_waiting() {
     assert_eq!(app.reservation(id).await.0, "EXPIRED");
     assert_eq!(app.balances(&tenant).await, (30, 0));
     app.assert_ledger_reconciles(&tenant).await;
+}
+
+const BATCH: usize = reaper::BATCH_SIZE as usize;
+
+/// Set a row's `expires_at` to `days` after the Unix epoch, so it is due
+/// ahead of everything else in the shared database.
+async fn backdate_row(pool: &PgPool, table: &str, id: Uuid, days: i32) {
+    sqlx::query(&format!(
+        "UPDATE {table} SET expires_at = 'epoch'::timestamptz + make_interval(days => $2) WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(days)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// [`backdate_row`] for every row of a wallet.
+async fn backdate_wallet(pool: &PgPool, table: &str, account_id: &str, tenant_id: &str, days: i32) {
+    sqlx::query(&format!(
+        "UPDATE {table} SET expires_at = 'epoch'::timestamptz + make_interval(days => $3) \
+         WHERE account_id = $1 AND tenant_id = $2"
+    ))
+    .bind(account_id)
+    .bind(tenant_id)
+    .bind(days)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Rows of a wallet in `table` that match `condition`.
+async fn count_where(pool: &PgPool, table: &str, condition: &str, account_id: &str, tenant_id: &str) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {table} WHERE account_id = $1 AND tenant_id = $2 AND {condition}"
+    ))
+    .bind(account_id)
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A wallet the reaper cannot process fails on its own: every pass still
+/// succeeds and the reservations behind it are expired, even though the
+/// broken wallet's reservations are due first and fill a whole batch.
+#[tokio::test]
+async fn reaper_expires_reservations_behind_a_failing_wallet() {
+    let app = TestApp::spawn().await;
+
+    // Broken wallet: a batch of 1-credit holds, then a 50-credit bucket.
+    let broken = unique_tenant("cus_reap_broken");
+    app.grant(&broken, BATCH as i64).await;
+    for _ in 0..BATCH {
+        assert_eq!(app.reserve(&broken, 1, 300).await.status, StatusCode::OK);
+    }
+    let bucket = app.grant_expiring(&broken, 50, Utc::now() + ChronoDuration::hours(1)).await;
+    assert_eq!(app.wallet_state(&broken).await, (50, 100, 50));
+
+    // Healthy wallet, in another account.
+    let (other_account, other) = app.second_account(NewAccount::unlimited("reaper isolation")).await;
+    let healthy = unique_tenant("cus_reap_healthy");
+    let res = post(&other, "/v1/credits/grant", &new_key(), json!({ "tenant_id": healthy, "amount": 30 })).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = post(
+        &other,
+        "/v1/credits/reserve",
+        &new_key(),
+        json!({ "tenant_id": healthy, "feature": "ai_enrichment", "estimate_credits": 10, "ttl_seconds": 300 }),
+    )
+    .await;
+    let healthy_id = reservation_id(&res);
+
+    // Break the wallet the way an old bug did: its bucket is due and settled
+    // with all 50 credits still in it, while the wallet still counts them as
+    // expiring. Locking it to expire anything now fails reading its buckets.
+    sqlx::query("UPDATE credit_buckets SET settled_at = NOW() WHERE id = $1")
+        .bind(bucket)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    backdate_row(&app.pool, "credit_buckets", bucket, 0).await;
+    sqlx::query("UPDATE wallets SET next_expiry_at = 'epoch' WHERE account_id = $1 AND tenant_id = $2")
+        .bind(&app.account_id)
+        .bind(&broken)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    // Every reservation overdue: the broken wallet's whole batch first, so a
+    // pass of any size up to BATCH_SIZE selects nothing else at first.
+    backdate_wallet(&app.pool, "reservations", &app.account_id, &broken, 0).await;
+    backdate_row(&app.pool, "reservations", healthy_id, 1).await;
+
+    // Nothing below panics until the wallet is repaired, so a failing run
+    // leaves no broken wallet behind in the shared database.
+    let mut passes = Vec::new();
+    for _ in 0..10 {
+        let pass = reaper::run_once(&app.pool, reaper::BATCH_SIZE).await;
+        let stop = pass.is_err()
+            || (pass.as_ref().is_ok_and(|p| p.wallets_failed > 0)
+                && app.reservation(healthy_id).await.0 == "EXPIRED");
+        passes.push(pass);
+        if stop {
+            break;
+        }
+    }
+    let healthy_status = app.reservation(healthy_id).await.0;
+    let broken_pending = || {
+        let (pool, account_id, tenant) = (app.pool.clone(), app.account_id.clone(), broken.clone());
+        async move { count_where(&pool, "reservations", "status = 'PENDING'", &account_id, &tenant).await }
+    };
+    let pending_while_broken = broken_pending().await;
+    let broken_state = app.wallet_state(&broken).await;
+    let broken_expire_entries = app.count_ledger(&broken, "EXPIRE").await;
+
+    // Repair: the bucket holds the wallet's expiring credits again.
+    sqlx::query("UPDATE credit_buckets SET settled_at = NULL WHERE id = $1")
+        .bind(bucket)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    for _ in 0..20 {
+        let _ = reaper::run_once(&app.pool, reaper::BATCH_SIZE).await;
+        if broken_pending().await == 0 {
+            break;
+        }
+    }
+
+    for pass in &passes {
+        assert!(pass.is_ok(), "one failing wallet must not fail the pass: {passes:?}");
+    }
+    assert!(
+        passes.iter().flatten().any(|p| p.wallets_failed >= 1),
+        "the broken wallet is reported as failed: {passes:?}"
+    );
+    assert_eq!(healthy_status, "EXPIRED", "the reservation behind the broken ones is expired: {passes:?}");
+    assert_eq!(common::balances(&app.pool, &other_account, &healthy).await, (30, 0));
+    let last = app.ledger_for(healthy_id).await.pop().unwrap();
+    assert_eq!(last, ("EXPIRE".to_owned(), 10, -10));
+    // The broken wallet's failed work was rolled back.
+    assert_eq!(pending_while_broken, BATCH as i64);
+    assert_eq!(broken_state, (50, 100, 50));
+    assert_eq!(broken_expire_entries, 0);
+
+    // Once repaired, the reaper catches up: the bucket's 50 credits expire
+    // and the 100 held come back.
+    assert_eq!(broken_pending().await, 0);
+    assert_eq!(app.count_ledger(&broken, "EXPIRE").await, BATCH as i64);
+    assert_eq!(app.wallet_state(&broken).await, (100, 0, 0));
+    app.assert_ledger_reconciles(&broken).await;
+    app.assert_buckets_reconcile(&broken).await;
+}
+
+/// The same for the bucket pass: a wallet whose buckets do not add up fails
+/// on its own and the due buckets behind it still expire.
+#[tokio::test]
+async fn reaper_expires_buckets_behind_a_failing_wallet() {
+    let app = TestApp::spawn().await;
+    let later = Utc::now() + ChronoDuration::hours(1);
+
+    // Broken wallet: a batch of 1-credit buckets. Healthy wallet: one bucket.
+    let broken = unique_tenant("cus_reap_broken_bucket");
+    let mut broken_buckets = Vec::new();
+    for _ in 0..BATCH {
+        broken_buckets.push(app.grant_expiring(&broken, 1, later).await);
+    }
+    let healthy = unique_tenant("cus_reap_healthy_bucket");
+    let healthy_bucket = app.grant_expiring(&healthy, 10, later).await;
+
+    // One broken bucket has lost the credit its wallet still counts, so
+    // expiring the wallet's buckets fails. All buckets due, the broken
+    // wallet's whole batch first.
+    sqlx::query("UPDATE credit_buckets SET remaining = 0 WHERE id = $1")
+        .bind(broken_buckets[0])
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    backdate_wallet(&app.pool, "credit_buckets", &app.account_id, &broken, 0).await;
+    backdate_row(&app.pool, "credit_buckets", healthy_bucket, 1).await;
+
+    let unsettled = |tenant: &str| {
+        let (pool, account_id, tenant) = (app.pool.clone(), app.account_id.clone(), tenant.to_owned());
+        async move { count_where(&pool, "credit_buckets", "settled_at IS NULL", &account_id, &tenant).await }
+    };
+    let mut passes = Vec::new();
+    for _ in 0..10 {
+        let pass = reaper::run_once(&app.pool, reaper::BATCH_SIZE).await;
+        let stop = pass.is_err()
+            || (pass.as_ref().is_ok_and(|p| p.bucket_wallets_failed > 0) && unsettled(&healthy).await == 0);
+        passes.push(pass);
+        if stop {
+            break;
+        }
+    }
+    let healthy_unsettled = unsettled(&healthy).await;
+    let broken_unsettled = unsettled(&broken).await;
+    let broken_state = app.wallet_state(&broken).await;
+
+    // Repair, then let the reaper catch up.
+    sqlx::query("UPDATE credit_buckets SET remaining = 1 WHERE id = $1")
+        .bind(broken_buckets[0])
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    for _ in 0..20 {
+        let _ = reaper::run_once(&app.pool, reaper::BATCH_SIZE).await;
+        if unsettled(&broken).await == 0 {
+            break;
+        }
+    }
+
+    for pass in &passes {
+        assert!(pass.is_ok(), "one failing wallet must not fail the pass: {passes:?}");
+    }
+    assert!(
+        passes.iter().flatten().any(|p| p.bucket_wallets_failed >= 1),
+        "the broken wallet is reported as failed: {passes:?}"
+    );
+    assert_eq!(healthy_unsettled, 0, "the bucket behind the broken ones expires: {passes:?}");
+    assert_eq!(app.wallet_state(&healthy).await, (0, 0, 0));
+    assert_eq!(app.count_ledger(&healthy, "CREDIT_EXPIRE").await, 1);
+    app.assert_buckets_reconcile(&healthy).await;
+    // The broken wallet's failed work was rolled back.
+    assert_eq!(broken_unsettled, BATCH as i64);
+    assert_eq!(broken_state, (100, 0, 100));
+
+    assert_eq!(unsettled(&broken).await, 0, "once repaired, the broken wallet's buckets expire");
+    assert_eq!(app.count_ledger(&broken, "CREDIT_EXPIRE").await, BATCH as i64);
+    assert_eq!(app.wallet_state(&broken).await, (0, 0, 0));
+    app.assert_ledger_reconciles(&broken).await;
+    app.assert_buckets_reconcile(&broken).await;
 }
 
 #[tokio::test]
