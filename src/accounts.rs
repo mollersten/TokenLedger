@@ -20,15 +20,29 @@ pub const TRIAL_MONTHLY_REQUESTS: i64 = 100_000;
 pub const TRIAL_MAX_TENANTS: i32 = 1_000;
 pub const TRIAL_RATE_LIMIT_PER_SEC: i32 = 50;
 
+pub const FREE_HOURLY_REQUESTS: i32 = 120;
+pub const FREE_GRACE_HOURLY_REQUESTS: i32 = 600;
+pub const FREE_RATE_LIMIT_PER_SEC: i32 = 10;
+
+/// How long the grace period lasts once an account first goes over its
+/// hourly limit.
+pub const GRACE_PERIOD_HOURS: i32 = 24;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plan {
+    /// No end date; 120 requests/hour (600 during the one-time grace
+    /// period) and 10 requests/second.
+    Free,
+    /// 14 days; 100 000 requests/month, 1 000 tenants, 50 requests/second.
     Trial,
+    /// No limits.
     Paid,
 }
 
 impl Plan {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Free => "free",
             Self::Trial => "trial",
             Self::Paid => "paid",
         }
@@ -36,9 +50,31 @@ impl Plan {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "free" => Some(Self::Free),
             "trial" => Some(Self::Trial),
             "paid" => Some(Self::Paid),
             _ => None,
+        }
+    }
+
+    /// The limits an account gets when it moves to this plan. Every field is
+    /// set, so applying it replaces all of the account's limits.
+    pub fn default_limits(self) -> LimitChange {
+        let (monthly, hourly, grace_hourly, tenants, per_sec) = match self {
+            Self::Free => {
+                (None, Some(FREE_HOURLY_REQUESTS), Some(FREE_GRACE_HOURLY_REQUESTS), None, Some(FREE_RATE_LIMIT_PER_SEC))
+            }
+            Self::Trial => {
+                (Some(TRIAL_MONTHLY_REQUESTS), None, None, Some(TRIAL_MAX_TENANTS), Some(TRIAL_RATE_LIMIT_PER_SEC))
+            }
+            Self::Paid => (None, None, None, None, None),
+        };
+        LimitChange {
+            monthly_request_limit: Some(monthly),
+            hourly_request_limit: Some(hourly),
+            grace_hourly_request_limit: Some(grace_hourly),
+            max_tenants: Some(tenants),
+            rate_limit_per_sec: Some(per_sec),
         }
     }
 }
@@ -50,33 +86,44 @@ pub struct NewAccount {
     pub plan: Plan,
     pub trial_ends_at: Option<DateTime<Utc>>,
     pub monthly_request_limit: Option<i64>,
+    pub hourly_request_limit: Option<i32>,
+    /// The hourly limit during the grace period. `None`: no grace period, so
+    /// requests over `hourly_request_limit` are refused straight away.
+    pub grace_hourly_request_limit: Option<i32>,
     pub max_tenants: Option<i32>,
     pub rate_limit_per_sec: Option<i32>,
 }
 
 impl NewAccount {
-    /// A free trial with the default limits.
-    pub fn trial(name: impl Into<String>) -> Self {
+    /// An account on `plan` with that plan's default limits (and, for a
+    /// trial, a trial window of [`TRIAL_DAYS`]).
+    pub fn on_plan(name: impl Into<String>, plan: Plan) -> Self {
+        let limits = plan.default_limits();
         Self {
             name: name.into(),
-            plan: Plan::Trial,
-            trial_ends_at: Some(Utc::now() + Duration::days(TRIAL_DAYS)),
-            monthly_request_limit: Some(TRIAL_MONTHLY_REQUESTS),
-            max_tenants: Some(TRIAL_MAX_TENANTS),
-            rate_limit_per_sec: Some(TRIAL_RATE_LIMIT_PER_SEC),
+            plan,
+            trial_ends_at: (plan == Plan::Trial).then(|| Utc::now() + Duration::days(TRIAL_DAYS)),
+            monthly_request_limit: limits.monthly_request_limit.flatten(),
+            hourly_request_limit: limits.hourly_request_limit.flatten(),
+            grace_hourly_request_limit: limits.grace_hourly_request_limit.flatten(),
+            max_tenants: limits.max_tenants.flatten(),
+            rate_limit_per_sec: limits.rate_limit_per_sec.flatten(),
         }
+    }
+
+    /// The free plan: 120 requests/hour, 600 during the grace period, 10/s.
+    pub fn free(name: impl Into<String>) -> Self {
+        Self::on_plan(name, Plan::Free)
+    }
+
+    /// A free trial with the default limits.
+    pub fn trial(name: impl Into<String>) -> Self {
+        Self::on_plan(name, Plan::Trial)
     }
 
     /// A paid account without limits.
     pub fn unlimited(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            plan: Plan::Paid,
-            trial_ends_at: None,
-            monthly_request_limit: None,
-            max_tenants: None,
-            rate_limit_per_sec: None,
-        }
+        Self::on_plan(name, Plan::Paid)
     }
 }
 
@@ -88,12 +135,17 @@ pub struct Account {
     pub status: String,
     pub trial_ends_at: Option<DateTime<Utc>>,
     pub monthly_request_limit: Option<i64>,
+    pub hourly_request_limit: Option<i32>,
+    pub grace_hourly_request_limit: Option<i32>,
+    /// When the grace period ends (or ended). `None`: it has not started.
+    pub grace_ends_at: Option<DateTime<Utc>>,
     pub max_tenants: Option<i32>,
     pub rate_limit_per_sec: Option<i32>,
     pub created_at: DateTime<Utc>,
 }
 
 const ACCOUNT_COLUMNS: &str = "id, name, plan, status, trial_ends_at, monthly_request_limit, \
+     hourly_request_limit, grace_hourly_request_limit, grace_ends_at, \
      max_tenants, rate_limit_per_sec, created_at";
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
@@ -104,6 +156,7 @@ pub struct AccountSummary {
     pub active_keys: i64,
     pub tenants: i64,
     pub requests_this_month: i64,
+    pub requests_this_hour: i64,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
@@ -128,6 +181,8 @@ pub struct IssuedKey {
 #[derive(Debug, Clone, Default)]
 pub struct LimitChange {
     pub monthly_request_limit: Option<Option<i64>>,
+    pub hourly_request_limit: Option<Option<i32>>,
+    pub grace_hourly_request_limit: Option<Option<i32>>,
     pub max_tenants: Option<Option<i32>>,
     pub rate_limit_per_sec: Option<Option<i32>>,
 }
@@ -147,14 +202,17 @@ fn random_id(prefix: &str) -> String {
 pub async fn create_account(pool: &PgPool, new: &NewAccount) -> Result<Account, sqlx::Error> {
     sqlx::query_as::<_, Account>(&format!(
         "INSERT INTO accounts \
-           (id, name, plan, trial_ends_at, monthly_request_limit, max_tenants, rate_limit_per_sec) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {ACCOUNT_COLUMNS}"
+           (id, name, plan, trial_ends_at, monthly_request_limit, hourly_request_limit, \
+            grace_hourly_request_limit, max_tenants, rate_limit_per_sec) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING {ACCOUNT_COLUMNS}"
     ))
     .bind(random_id("acct"))
     .bind(&new.name)
     .bind(new.plan.as_str())
     .bind(new.trial_ends_at)
     .bind(new.monthly_request_limit)
+    .bind(new.hourly_request_limit)
+    .bind(new.grace_hourly_request_limit)
     .bind(new.max_tenants)
     .bind(new.rate_limit_per_sec)
     .fetch_one(pool)
@@ -208,10 +266,68 @@ pub async fn set_status(pool: &PgPool, account_id: &str, active: bool) -> Result
     Ok(result.rows_affected() == 1)
 }
 
-pub async fn set_plan(pool: &PgPool, account_id: &str, plan: Plan) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("UPDATE accounts SET plan = $2, updated_at = NOW() WHERE id = $1")
+/// Move an account to `plan`. Unless `keep_limits`, its limits are replaced
+/// with the plan's defaults, so an upgrade to paid lifts every limit (the
+/// hourly limit included) and a downgrade to free brings them back. Running
+/// servers apply the change within their auth cache TTL.
+pub async fn set_plan(pool: &PgPool, account_id: &str, plan: Plan, keep_limits: bool) -> Result<bool, sqlx::Error> {
+    let limits = if keep_limits { LimitChange::default() } else { plan.default_limits() };
+    let mut qb = QueryBuilder::<Postgres>::new("UPDATE accounts SET updated_at = NOW(), plan = ");
+    qb.push_bind(plan.as_str());
+    push_limits(&mut qb, &limits);
+    qb.push(" WHERE id = ").push_bind(account_id);
+    Ok(qb.build().execute(pool).await?.rows_affected() == 1)
+}
+
+/// Called on the first request over the hourly limit: starts the grace
+/// period unless it has already started (on this or another server), and
+/// returns when it ends. `None` if the account has no grace limit.
+pub async fn start_grace(pool: &PgPool, account_id: &str) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    // The UPDATE sees the latest committed row even when another server
+    // started the grace period a moment ago, so both get the same end time.
+    sqlx::query_scalar(
+        "UPDATE accounts \
+         SET grace_ends_at = COALESCE(grace_ends_at, NOW() + make_interval(hours => $2)), \
+             updated_at = CASE WHEN grace_ends_at IS NULL THEN NOW() ELSE updated_at END \
+         WHERE id = $1 AND grace_hourly_request_limit IS NOT NULL \
+         RETURNING grace_ends_at",
+    )
+    .bind(account_id)
+    .bind(GRACE_PERIOD_HOURS)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Give an account `hours` more grace: from the current end if it is still
+/// running, otherwise from now (which also starts a grace period that has
+/// not begun). Returns the new end.
+pub async fn extend_grace(
+    pool: &PgPool,
+    account_id: &str,
+    hours: i32,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    sqlx::query_scalar(
+        "UPDATE accounts \
+         SET grace_ends_at = GREATEST(COALESCE(grace_ends_at, NOW()), NOW()) + make_interval(hours => $2), \
+             updated_at = NOW() \
+         WHERE id = $1 RETURNING grace_ends_at",
+    )
+    .bind(account_id)
+    .bind(hours)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Set (or clear) the grace period's end directly. Clearing it lets the
+/// next request over the hourly limit start a fresh grace period.
+pub async fn set_grace_end(
+    pool: &PgPool,
+    account_id: &str,
+    ends_at: Option<DateTime<Utc>>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE accounts SET grace_ends_at = $2, updated_at = NOW() WHERE id = $1")
         .bind(account_id)
-        .bind(plan.as_str())
+        .bind(ends_at)
         .execute(pool)
         .await?;
     Ok(result.rows_affected() == 1)
@@ -248,10 +364,15 @@ pub async fn set_trial_end(
     Ok(result.rows_affected() == 1)
 }
 
-pub async fn set_limits(pool: &PgPool, account_id: &str, change: &LimitChange) -> Result<bool, sqlx::Error> {
-    let mut qb = QueryBuilder::<Postgres>::new("UPDATE accounts SET updated_at = NOW()");
+fn push_limits(qb: &mut QueryBuilder<'_, Postgres>, change: &LimitChange) {
     if let Some(v) = change.monthly_request_limit {
         qb.push(", monthly_request_limit = ").push_bind(v);
+    }
+    if let Some(v) = change.hourly_request_limit {
+        qb.push(", hourly_request_limit = ").push_bind(v);
+    }
+    if let Some(v) = change.grace_hourly_request_limit {
+        qb.push(", grace_hourly_request_limit = ").push_bind(v);
     }
     if let Some(v) = change.max_tenants {
         qb.push(", max_tenants = ").push_bind(v);
@@ -259,6 +380,11 @@ pub async fn set_limits(pool: &PgPool, account_id: &str, change: &LimitChange) -
     if let Some(v) = change.rate_limit_per_sec {
         qb.push(", rate_limit_per_sec = ").push_bind(v);
     }
+}
+
+pub async fn set_limits(pool: &PgPool, account_id: &str, change: &LimitChange) -> Result<bool, sqlx::Error> {
+    let mut qb = QueryBuilder::<Postgres>::new("UPDATE accounts SET updated_at = NOW()");
+    push_limits(&mut qb, change);
     qb.push(" WHERE id = ").push_bind(account_id);
     Ok(qb.build().execute(pool).await?.rows_affected() == 1)
 }
@@ -266,13 +392,17 @@ pub async fn set_limits(pool: &PgPool, account_id: &str, change: &LimitChange) -
 pub async fn list_accounts(pool: &PgPool) -> Result<Vec<AccountSummary>, sqlx::Error> {
     sqlx::query_as::<_, AccountSummary>(
         "SELECT a.id, a.name, a.plan, a.status, a.trial_ends_at, a.monthly_request_limit, \
+                a.hourly_request_limit, a.grace_hourly_request_limit, a.grace_ends_at, \
                 a.max_tenants, a.rate_limit_per_sec, a.created_at, \
                 (SELECT COUNT(*) FROM api_keys k WHERE k.account_id = a.id AND k.revoked_at IS NULL) AS active_keys, \
                 (SELECT COUNT(*) FROM wallets w WHERE w.account_id = a.id) AS tenants, \
                 COALESCE((SELECT u.request_count FROM account_usage u \
                           WHERE u.account_id = a.id \
                             AND u.period_start = date_trunc('month', NOW() AT TIME ZONE 'UTC')::date), 0) \
-                  AS requests_this_month \
+                  AS requests_this_month, \
+                COALESCE((SELECT h.request_count FROM account_hourly_usage h \
+                          WHERE h.account_id = a.id AND h.hour_start = date_trunc('hour', NOW(), 'UTC')), 0) \
+                  AS requests_this_hour \
          FROM accounts a ORDER BY a.created_at",
     )
     .fetch_all(pool)

@@ -138,22 +138,25 @@ async fn suspended_accounts_and_expired_trials_are_refused() {
     accounts::set_trial_end(&app.pool, &app.account_id, Some(Utc::now() - chrono::Duration::minutes(1)))
         .await
         .unwrap();
-    accounts::set_plan(&app.pool, &app.account_id, accounts::Plan::Paid).await.unwrap();
+    accounts::set_plan(&app.pool, &app.account_id, accounts::Plan::Paid, false).await.unwrap();
     assert_eq!(app.grant_raw(&tenant, 5).await.status, StatusCode::OK);
     assert_eq!(app.balances(&tenant).await, (15, 0));
 }
 
 #[tokio::test]
-async fn per_key_rate_limit_returns_429_with_retry_after() {
+async fn per_account_rate_limit_returns_429_with_retry_after() {
     let mut account = unlimited();
     account.rate_limit_per_sec = Some(5);
     let app = TestApp::spawn_with(account).await;
     let path = format!("/v1/tenants/{}/wallet", unique_tenant("cus_rate"));
+    // A second key draws from the same per-account budget.
+    let second = accounts::issue_key(&app.pool, &app.account_id, None).await.unwrap();
+    let keys = [app.api.clone(), app.api.with_key(Some(&second.secret))];
 
     let mut allowed = 0;
     let mut limited = Vec::new();
-    for _ in 0..12 {
-        let res = app.get(&path).await;
+    for i in 0..12 {
+        let res = send(&keys[i % 2], Method::GET, &path, None, None).await;
         match res.status {
             StatusCode::NOT_FOUND => allowed += 1, // authenticated, wallet simply missing
             StatusCode::TOO_MANY_REQUESTS => limited.push(res),
@@ -186,7 +189,7 @@ async fn monthly_quota_is_enforced_and_persisted() {
     assert!(retry > 0 && retry <= 31 * 86_400, "retry after the month resets: {retry}");
     assert_eq!(app.balances(&tenant).await, (2, 0), "the rejected grant did nothing");
 
-    assert_eq!(app.state.usage.flush(&app.pool).await.unwrap(), 1);
+    assert_eq!(app.state.usage.flush(&app.pool).await.unwrap(), 2, "one hourly and one monthly row");
     let recorded: i64 = sqlx::query_scalar("SELECT request_count FROM account_usage WHERE account_id = $1")
         .bind(&app.account_id)
         .fetch_one(&app.pool)
