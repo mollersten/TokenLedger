@@ -1,6 +1,8 @@
 //! HTTP load generator for the TokenLedger API.
 //!
-//! Start the server in release mode first, then:
+//! Start the server in release mode on the local database first
+//! (`scripts/with-local-db.sh cargo run --release`; plain `cargo run` uses
+//! the real database on Supabase), then:
 //!
 //!   cargo run --release --example loadtest -- \
 //!       --url http://127.0.0.1:8080 --concurrency 64 --duration 10
@@ -439,6 +441,11 @@ async fn main() {
     // the database the server uses.
     let _ = dotenvy::dotenv();
     let db_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB_URL.to_owned());
+    assert!(
+        backend::is_local_database(&db_url),
+        "TEST_DATABASE_URL points at {}; the load test only runs against a database on this machine",
+        backend::database_label(&db_url)
+    );
     let pool = backend::connect(&db_url, 2).await.expect("connect to the database");
     let account = backend::accounts::create_account(
         &pool,

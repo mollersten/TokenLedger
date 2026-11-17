@@ -4,9 +4,10 @@
 //! Every `TestApp` gets its own account and API key, so tests are isolated
 //! from each other and repeatable against a persistent database.
 //!
-//! Uses `TEST_DATABASE_URL` (never `DATABASE_URL`, so tests can't hit a
-//! remote database by accident), defaulting to the local dev database from
-//! `scripts/local-pg.sh` / `docker-compose.yml`.
+//! Uses `TEST_DATABASE_URL` (never `DATABASE_URL`, which points at the real
+//! database on Supabase), defaulting to the local dev database from
+//! `scripts/local-pg.sh` / `docker-compose.yml`. Refuses to run against a
+//! database that isn't on this machine.
 #![allow(dead_code)]
 
 use std::time::Duration;
@@ -109,6 +110,12 @@ pub async fn post(api: &Api, path: &str, key: &str, body: Value) -> TestResponse
 pub async fn test_pool() -> PgPool {
     let _ = dotenvy::dotenv();
     let url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| DEFAULT_TEST_DATABASE_URL.to_owned());
+    assert!(
+        backend::is_local_database(&url),
+        "TEST_DATABASE_URL points at {}; the tests create and change data, so they only run against a \
+         database on this machine",
+        backend::database_label(&url)
+    );
     let pool = backend::connect(&url, 30)
         .await
         .expect("cannot reach the test database; start it with `scripts/local-pg.sh start`");

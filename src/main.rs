@@ -14,7 +14,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let pool = backend::connect(&config.database_url, config.max_connections).await?;
     backend::MIGRATOR.run(&pool).await?;
-    tracing::info!("database connected and migrations applied");
+    tracing::info!(
+        database = %backend::database_label(&config.database_url),
+        max_connections = config.max_connections,
+        "database connected and migrations applied"
+    );
 
     let state = AppState::with_auth_cache_ttl(pool.clone(), config.auth_cache_ttl);
     let reaper = reaper::spawn(pool.clone(), config.reaper_interval);

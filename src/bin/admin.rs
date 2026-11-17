@@ -1,10 +1,13 @@
 //! Account and API key administration for TokenLedger.
 //!
-//! Uses DATABASE_URL (from the environment or backend/.env) and applies any
-//! pending migrations first.
+//! Uses DATABASE_URL (from the environment or backend/.env, where it points at
+//! the real database on Supabase) and applies any pending migrations first.
+//! Prints the database it uses to stderr before every command. To work on the
+//! local database instead, prefix the command with `scripts/with-local-db.sh`.
 //!
 //!   cargo run --bin admin -- create-account --name "Acme AI"
 //!   cargo run --bin admin -- list
+//!   scripts/with-local-db.sh cargo run --bin admin -- list
 //!
 //! Commands:
 //!   create-account --name NAME [--plan free|trial|paid] [--trial-days N]
@@ -149,6 +152,7 @@ fn limit_change(flags: &Flags) -> Result<LimitChange, String> {
 async fn run(command: &str, flags: &Flags) -> Result<(), String> {
     let _ = dotenvy::dotenv();
     let url = std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set".to_owned())?;
+    eprintln!("database: {}", backend::database_label(&url));
     let pool = backend::connect(&url, 2).await.map_err(|e| format!("cannot connect: {e}"))?;
     backend::MIGRATOR.run(&pool).await.map_err(|e| format!("migrations failed: {e}"))?;
     let db = |e: sqlx::Error| format!("database error: {e}");
