@@ -2,50 +2,64 @@
 //!
 //! Uses DATABASE_URL (from the environment or backend/.env, where it points at
 //! the real database on Supabase) and applies any pending migrations first.
-//! Prints the database it uses to stderr before every command. To work on the
+//! Prints the database it uses to stderr when it connects. To work on the
 //! local database instead, prefix the command with `scripts/with-local-db.sh`.
 //!
-//!   cargo run --bin admin -- create-account --name "Acme AI"
-//!   cargo run --bin admin -- list
-//!   scripts/with-local-db.sh cargo run --bin admin -- list
+//! With no arguments it opens an interactive shell: it connects once, then
+//! runs one command per line until `exit` or Ctrl-D, with line editing and
+//! history (kept in ~/.tokenledger_admin_history):
 //!
-//! Commands:
-//!   create-account --name NAME [--plan free|trial|paid] [--trial-days N]
-//!                  [--monthly-requests N|unlimited] [--hourly-requests N|unlimited]
-//!                  [--grace-hourly-requests N|unlimited] [--max-tenants N|unlimited]
-//!                  [--rate-limit N|unlimited] [--key-label LABEL] [--no-key]
-//!       Free: 120 requests/hour (600/hour for 24 h after the first time it
-//!       goes over), 10 req/s, no end date.
-//!       Trial (the default): 14 days, 100000 requests/month, 1000 tenants, 50 req/s.
-//!       Paid: unlimited. Issues a first API key unless --no-key.
-//!   create-key    --account ID [--label LABEL]
-//!   revoke-key    --key KEY_ID
-//!   list
-//!   keys          --account ID
-//!   suspend       --account ID
-//!   activate      --account ID
-//!   extend-trial  --account ID --days N
-//!   set-plan      --account ID --plan free|trial|paid [--keep-limits]
-//!       Applies the plan's limits (an upgrade to paid lifts them all) unless
-//!       --keep-limits.
-//!   set-limits    --account ID [--monthly-requests N|unlimited]
-//!                 [--hourly-requests N|unlimited] [--grace-hourly-requests N|unlimited]
-//!                 [--max-tenants N|unlimited] [--rate-limit N|unlimited]
-//!   extend-grace  --account ID --hours N
-//!       Gives N more hours at the grace limit (starting now if it is over or
-//!       has not started).
-//!   reset-grace   --account ID
-//!       Lets the next request over the hourly limit start a new grace period.
+//!   cargo run -q --bin admin
+//!   admin@supabase> list
+//!   admin@supabase> create-account --name "Acme AI" --plan free
 //!
-//! Changes reach running servers within their auth cache TTL (30 s default).
+//! With arguments it runs that one command and exits:
+//!
+//!   cargo run -q --bin admin -- list
+//!   scripts/with-local-db.sh cargo run -q --bin admin -- list
+//!
+//! The commands and their flags are in `HELP` below (`help` prints them).
 
-use std::{collections::HashMap, process::ExitCode};
+use std::{collections::HashMap, io::IsTerminal, path::PathBuf, process::ExitCode};
 
 use backend::accounts::{self, Account, IssuedKey, LimitChange, NewAccount, Plan};
 use chrono::{DateTime, Duration, Utc};
+use rustyline::{DefaultEditor, error::ReadlineError};
+use sqlx::PgPool;
 
-const USAGE: &str = "usage: admin <create-account|create-key|revoke-key|list|keys|suspend|activate|extend-trial|set-plan|set-limits|extend-grace|reset-grace> [--flag value ...]
-see the doc comment in src/bin/admin.rs for every flag";
+const HELP: &str = "\
+Commands:
+  create-account --name NAME [--plan free|trial|paid] [--trial-days N]
+                 [--monthly-requests N|unlimited] [--hourly-requests N|unlimited]
+                 [--grace-hourly-requests N|unlimited] [--max-tenants N|unlimited]
+                 [--rate-limit N|unlimited] [--key-label LABEL] [--no-key]
+      Free: 120 requests/hour (600/hour for 24 h after the first time it
+      goes over), 10 req/s, no end date.
+      Trial (the default): 14 days, 100000 requests/month, 1000 tenants, 50 req/s.
+      Paid: unlimited. Issues a first API key unless --no-key.
+  create-key    --account ID [--label LABEL]
+  revoke-key    --key KEY_ID
+  list
+  keys          --account ID
+  suspend       --account ID
+  activate      --account ID
+  extend-trial  --account ID --days N
+  set-plan      --account ID --plan free|trial|paid [--keep-limits]
+      Applies the plan's limits (an upgrade to paid lifts them all) unless
+      --keep-limits.
+  set-limits    --account ID [--monthly-requests N|unlimited]
+                [--hourly-requests N|unlimited] [--grace-hourly-requests N|unlimited]
+                [--max-tenants N|unlimited] [--rate-limit N|unlimited]
+  extend-grace  --account ID --hours N
+      Gives N more hours at the grace limit (starting now if it is over or
+      has not started).
+  reset-grace   --account ID
+      Lets the next request over the hourly limit start a new grace period.
+
+Changes reach running servers within their auth cache TTL (30 s default).
+Values with spaces need quotes: --name \"Acme AI\".";
+
+const SHELL_HELP: &str = "In the shell: help, exit (or Ctrl-D). Ctrl-C clears the line.";
 
 struct Flags(HashMap<String, Option<String>>);
 
@@ -149,12 +163,153 @@ fn limit_change(flags: &Flags) -> Result<LimitChange, String> {
     })
 }
 
-async fn run(command: &str, flags: &Flags) -> Result<(), String> {
+/// Connects to DATABASE_URL and applies pending migrations. Returns the pool
+/// and the URL (for the shell prompt).
+async fn connect() -> Result<(PgPool, String), String> {
     let _ = dotenvy::dotenv();
     let url = std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set".to_owned())?;
     eprintln!("database: {}", backend::database_label(&url));
     let pool = backend::connect(&url, 2).await.map_err(|e| format!("cannot connect: {e}"))?;
     backend::MIGRATOR.run(&pool).await.map_err(|e| format!("migrations failed: {e}"))?;
+    Ok((pool, url))
+}
+
+/// Splits a shell line into words: whitespace separates them, single and
+/// double quotes group them, and a backslash escapes the next character
+/// (except inside single quotes).
+fn split_words(line: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some('"') if c == '\\' => word.extend(chars.next()),
+            Some(_) => word.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            None if c == '\\' => {
+                word.extend(chars.next());
+                in_word = true;
+            }
+            None if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            None => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return Err("unclosed quote".to_owned());
+    }
+    if in_word {
+        words.push(word);
+    }
+    Ok(words)
+}
+
+/// A shell line as a command and its arguments. Also accepts a pasted
+/// one-shot command (`admin list`, `cargo run -q --bin admin -- list`).
+fn shell_command(words: &[String]) -> Option<(&str, &[String])> {
+    let words = match words.first().map(String::as_str) {
+        Some("admin") => &words[1..],
+        Some("cargo") => match words.iter().position(|w| w == "--") {
+            Some(i) => &words[i + 1..],
+            None => &words[words.len()..],
+        },
+        _ => words,
+    };
+    words.split_first().map(|(c, rest)| (c.as_str(), rest))
+}
+
+/// Short name of the database for the prompt.
+fn prompt_name(url: &str) -> String {
+    let label = backend::database_label(url);
+    if backend::is_local_database(url) {
+        "local".to_owned()
+    } else if label.contains(".supabase.com") || label.contains(".supabase.co") {
+        "supabase".to_owned()
+    } else {
+        label.split(':').next().unwrap_or(&label).to_owned()
+    }
+}
+
+fn history_file() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".tokenledger_admin_history"))
+}
+
+async fn shell(pool: &PgPool, url: &str) -> ExitCode {
+    let mut editor = match DefaultEditor::new() {
+        Ok(editor) => editor,
+        Err(e) => {
+            eprintln!("error: cannot start the shell: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Piped input (scripts, tests) neither reads nor writes the history.
+    let history = history_file().filter(|_| std::io::stdin().is_terminal());
+    if let Some(path) = &history {
+        let _ = editor.load_history(path);
+    }
+    let prompt = format!("admin@{}> ", prompt_name(url));
+    println!("TokenLedger admin shell. Type `help` for commands. {SHELL_HELP}");
+
+    loop {
+        // Reading a line blocks; let the runtime move other tasks off this thread.
+        let line = match tokio::task::block_in_place(|| editor.readline(&prompt)) {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Eof) => break,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let _ = editor.add_history_entry(line);
+        if let Some(path) = &history {
+            let _ = editor.save_history(path);
+        }
+        let words = match split_words(line) {
+            Ok(words) => words,
+            Err(e) => {
+                eprintln!("error: {e}");
+                continue;
+            }
+        };
+        let Some((command, args)) = shell_command(&words) else { continue };
+        let result = match command {
+            "exit" | "quit" => break,
+            "help" | "?" | "--help" | "-h" => {
+                println!("{HELP}\n\n{SHELL_HELP}");
+                Ok(())
+            }
+            _ => match Flags::parse(args) {
+                Ok(flags) => run(pool, command, &flags).await,
+                Err(e) => Err(e),
+            },
+        };
+        if let Err(e) = result {
+            eprintln!("error: {e}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+async fn run(pool: &PgPool, command: &str, flags: &Flags) -> Result<(), String> {
+    let pool = pool.clone();
     let db = |e: sqlx::Error| format!("database error: {e}");
     let found = |ok: bool, what: &str| if ok { Ok(()) } else { Err(format!("{what} not found")) };
 
@@ -278,7 +433,7 @@ async fn run(command: &str, flags: &Flags) -> Result<(), String> {
             found(accounts::set_grace_end(&pool, account_id, None).await.map_err(db)?, "account")?;
             println!("{account_id} will get a new grace period the next time it goes over its hourly limit");
         }
-        other => return Err(format!("unknown command '{other}'\n{USAGE}")),
+        other => return Err(format!("unknown command '{other}' (type `help` for the list)")),
     }
     Ok(())
 }
@@ -286,16 +441,24 @@ async fn run(command: &str, flags: &Flags) -> Result<(), String> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some((command, rest)) = args.split_first() else {
-        eprintln!("{USAGE}");
-        return ExitCode::FAILURE;
-    };
-    if command == "-h" || command == "--help" {
-        println!("{USAGE}");
+    if let Some(first) = args.first()
+        && matches!(first.as_str(), "help" | "-h" | "--help")
+    {
+        println!("usage: admin                      (interactive shell)\n       admin <command> [--flag value ...]\n\n{HELP}");
         return ExitCode::SUCCESS;
     }
+    let (pool, url) = match connect().await {
+        Ok(connected) => connected,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some((command, rest)) = args.split_first() else {
+        return shell(&pool, &url).await;
+    };
     let result = match Flags::parse(rest) {
-        Ok(flags) => run(command, &flags).await,
+        Ok(flags) => run(&pool, command, &flags).await,
         Err(e) => Err(e),
     };
     match result {
@@ -304,5 +467,50 @@ async fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(line: &str) -> Vec<String> {
+        split_words(line).unwrap()
+    }
+
+    #[test]
+    fn splits_like_a_shell() {
+        assert_eq!(words("  list  "), ["list"]);
+        assert_eq!(
+            words(r#"create-account --name "Acme AI" --plan free"#),
+            ["create-account", "--name", "Acme AI", "--plan", "free"]
+        );
+        assert_eq!(words("--name 'O\"Neil Co'"), ["--name", "O\"Neil Co"]);
+        assert_eq!(words(r#"--name "say \"hi\"" --x a\ b"#), ["--name", "say \"hi\"", "--x", "a b"]);
+        assert_eq!(words(r#"--label """#), ["--label", ""]);
+        assert!(words("").is_empty());
+        assert_eq!(split_words(r#"--name "Acme"#), Err("unclosed quote".to_owned()));
+    }
+
+    #[test]
+    fn accepts_pasted_one_shot_commands() {
+        for line in ["list", "admin list", "cargo run -q --bin admin -- list"] {
+            let w = words(line);
+            assert_eq!(shell_command(&w).map(|(c, _)| c), Some("list"), "{line}");
+        }
+        let w = words("cargo run --bin admin -- keys --account acct_1");
+        let (command, args) = shell_command(&w).unwrap();
+        assert_eq!((command, args.len()), ("keys", 2));
+        assert_eq!(shell_command(&words("cargo build")), None);
+    }
+
+    #[test]
+    fn prompt_names_the_database() {
+        assert_eq!(prompt_name("postgres://postgres:postgres@localhost:5432/tokenledger"), "local");
+        assert_eq!(
+            prompt_name("postgresql://postgres.abc:pw@aws-0-eu-west-1.pooler.supabase.com:5432/postgres"),
+            "supabase"
+        );
+        assert_eq!(prompt_name("postgres://u:p@db.example.com:5432/app"), "db.example.com");
     }
 }
