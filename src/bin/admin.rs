@@ -39,7 +39,10 @@ Commands:
       Paid: unlimited. Issues a first API key unless --no-key.
   create-key    --account ID [--label LABEL]
   revoke-key    --key KEY_ID
+  accounts
+      Every account's id and name.
   list
+      Every account with its plan, status, keys, tenants, usage and limits.
   keys          --account ID
   suspend       --account ID
   activate      --account ID
@@ -357,6 +360,19 @@ async fn run(pool: &PgPool, command: &str, flags: &Flags) -> Result<(), String> 
             let key_id = flags.req("key")?;
             found(accounts::revoke_key(&pool, key_id).await.map_err(db)?, "active key")?;
             println!("Revoked {key_id}. Running servers reject it within 30 s.");
+        }
+        "accounts" => {
+            let names = accounts::list_account_names(&pool).await.map_err(db)?;
+            if names.is_empty() {
+                println!("No accounts yet.");
+            } else {
+                let width = names.iter().map(|(id, _)| id.len()).max().unwrap_or(0).max("id".len());
+                println!("{:<width$}  name", "id");
+                for (id, name) in &names {
+                    println!("{id:<width$}  {name}");
+                }
+                println!("{} account{}", names.len(), if names.len() == 1 { "" } else { "s" });
+            }
         }
         "list" => {
             let all = accounts::list_accounts(&pool).await.map_err(db)?;

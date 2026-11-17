@@ -409,6 +409,11 @@ pub async fn list_accounts(pool: &PgPool) -> Result<Vec<AccountSummary>, sqlx::E
     .await
 }
 
+/// Every account's id and name, oldest first.
+pub async fn list_account_names(pool: &PgPool) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as("SELECT id, name FROM accounts ORDER BY created_at, id").fetch_all(pool).await
+}
+
 pub async fn list_keys(pool: &PgPool, account_id: &str) -> Result<Vec<KeySummary>, sqlx::Error> {
     sqlx::query_as::<_, KeySummary>(
         "SELECT id, key_prefix, label, created_at, revoked_at FROM api_keys \
