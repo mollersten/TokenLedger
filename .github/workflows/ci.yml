@@ -1,0 +1,75 @@
+name: CI
+
+# Runs clippy and the integration tests on every push and pull request.
+#
+# No secrets and no DATABASE_URL: CI never touches the real (Supabase)
+# database. The tests only use TEST_DATABASE_URL, which here points at the
+# throwaway Postgres service container below. `cargo test` applies the
+# migrations itself, and backend/.env is git-ignored, so none is needed.
+
+on:
+  push:
+  pull_request:
+
+# A newer push to the same ref cancels the run that is still going.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Cargo.toml needs Rust 1.88 or newer (edition 2024 and let-chains; see
+  # rust-version there). Pinned to
+  # the version used locally, so a new stable release (and its new clippy
+  # lints) cannot turn `-D warnings` red without a code change. Bump it
+  # deliberately.
+  RUST_TOOLCHAIN: "1.99"
+
+jobs:
+  test:
+    name: clippy + cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        # Same image and credentials as docker-compose.yml.
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tokenledger
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tokenledger"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+    env:
+      # Local (the harness refuses anything else) and discarded with the job.
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/tokenledger
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo clippy --version
+
+      # Caches ~/.cargo and target/, keyed on Cargo.lock and the rustc version.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test
