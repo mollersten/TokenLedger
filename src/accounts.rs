@@ -275,6 +275,14 @@ pub async fn set_plan(pool: &PgPool, account_id: &str, plan: Plan, keep_limits: 
     let mut qb = QueryBuilder::<Postgres>::new("UPDATE accounts SET updated_at = NOW(), plan = ");
     qb.push_bind(plan.as_str());
     push_limits(&mut qb, &limits);
+    if plan == Plan::Trial {
+        // A trial needs an end: give a fresh window unless one is still running.
+        qb.push(
+            ", trial_ends_at = CASE WHEN trial_ends_at IS NULL OR trial_ends_at <= NOW() \
+               THEN NOW() + make_interval(days => ",
+        );
+        qb.push_bind(TRIAL_DAYS as i32).push(") ELSE trial_ends_at END");
+    }
     qb.push(" WHERE id = ").push_bind(account_id);
     Ok(qb.build().execute(pool).await?.rows_affected() == 1)
 }
@@ -422,4 +430,24 @@ pub async fn list_keys(pool: &PgPool, account_id: &str) -> Result<Vec<KeySummary
     .bind(account_id)
     .fetch_all(pool)
     .await
+}
+
+/// The longest an account can keep owned items before they expire.
+pub const MAX_ITEM_RETENTION_DAYS: i32 = 36_500;
+
+/// How many days owned items last for this account (`None`: forever).
+pub async fn item_retention_days(pool: &PgPool, account_id: &str) -> Result<Option<i32>, sqlx::Error> {
+    sqlx::query_scalar("SELECT item_retention_days FROM accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_one(pool)
+        .await
+}
+
+pub async fn set_item_retention_days(pool: &PgPool, account_id: &str, days: Option<i32>) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE accounts SET item_retention_days = $2, updated_at = NOW() WHERE id = $1")
+        .bind(account_id)
+        .bind(days)
+        .execute(pool)
+        .await?;
+    Ok(())
 }

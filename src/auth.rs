@@ -21,6 +21,13 @@
 //!    [`HourlyQuota`]).
 //! 6. Monthly request quota (429 `monthly_quota_exceeded`).
 //!
+//! Steps 4-6 apply to the customers' own actions only: `/v1/import` (moving
+//! customers over from another system) is neither limited nor counted here
+//! (it has its own daily safety caps, and the tenant limit still applies). A
+//! tenant's balance can be imported only once, so later top-ups must go
+//! through `grant`, which counts. A new tenant's first balance, though, can
+//! come through an import without counting.
+//!
 //! Requests are counted in memory and flushed to `account_hourly_usage` and
 //! `account_usage` in batches, so the hot path never writes a per-account
 //! row. Only accepted requests are counted.
@@ -32,7 +39,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -105,23 +112,43 @@ fn next_month(start: DateTime<Utc>) -> DateTime<Utc> {
 /// Key hash -> (lookup result, when it was fetched). `None` caches a miss.
 type CacheEntries = HashMap<String, (Option<Arc<AuthContext>>, Instant)>;
 
+/// Key lookups that may hit the database at once. A key that is not cached
+/// (a new one, or a made-up one in a flood of bad keys) costs a query; this
+/// keeps such lookups from taking the whole pool from everyone else.
+const MAX_CONCURRENT_LOOKUPS: usize = 4;
+const LOOKUP_WAIT: Duration = Duration::from_secs(2);
+
 pub struct AuthCache {
     ttl: Duration,
     entries: Mutex<CacheEntries>,
+    lookups: tokio::sync::Semaphore,
 }
 
 impl AuthCache {
     pub fn new(ttl: Duration) -> Self {
-        Self { ttl, entries: Mutex::new(HashMap::new()) }
+        Self { ttl, entries: Mutex::new(HashMap::new()), lookups: tokio::sync::Semaphore::new(MAX_CONCURRENT_LOOKUPS) }
     }
 
-    pub async fn resolve(&self, pool: &PgPool, secret: &str) -> Result<Option<Arc<AuthContext>>, sqlx::Error> {
+    fn cached(&self, hash: &str) -> Option<Option<Arc<AuthContext>>> {
+        if self.ttl.is_zero() {
+            return None;
+        }
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.get(hash).filter(|(_, fetched)| fetched.elapsed() < self.ttl).map(|(ctx, _)| ctx.clone())
+    }
+
+    pub async fn resolve(&self, pool: &PgPool, secret: &str) -> Result<Option<Arc<AuthContext>>, ApiError> {
         let hash = hash_secret(secret);
-        if !self.ttl.is_zero()
-            && let Some((ctx, fetched)) = self.entries.lock().unwrap().get(&hash)
-            && fetched.elapsed() < self.ttl
-        {
-            return Ok(ctx.clone());
+        if let Some(ctx) = self.cached(&hash) {
+            return Ok(ctx);
+        }
+        let _permit = tokio::time::timeout(LOOKUP_WAIT, self.lookups.acquire())
+            .await
+            .map_err(|_| ApiError::unavailable("service_busy", "the server is busy; retry shortly", 1))?
+            .map_err(|_| ApiError::internal("auth lookup semaphore closed"))?;
+        // Another request may have looked this key up while we waited.
+        if let Some(ctx) = self.cached(&hash) {
+            return Ok(ctx);
         }
 
         let now = Utc::now();
@@ -146,9 +173,18 @@ impl AuthCache {
         .map(Arc::new);
 
         if !self.ttl.is_zero() {
-            let mut entries = self.entries.lock().unwrap();
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
             if entries.len() >= MAX_CACHED_KEYS {
-                entries.clear();
+                // Drop what is stale, then cached misses (a flood of bad keys
+                // must not push out the real ones); only then everything.
+                let ttl = self.ttl;
+                entries.retain(|_, (_, fetched)| fetched.elapsed() < ttl);
+                if entries.len() >= MAX_CACHED_KEYS {
+                    entries.retain(|_, (ctx, _)| ctx.is_some());
+                }
+                if entries.len() >= MAX_CACHED_KEYS {
+                    entries.clear();
+                }
             }
             entries.insert(hash, (ctx.clone(), Instant::now()));
         }
@@ -168,7 +204,7 @@ impl AuthCache {
             }
             Arc::new(c)
         };
-        for (entry, _) in self.entries.lock().unwrap().values_mut() {
+        for (entry, _) in self.entries.lock().unwrap_or_else(PoisonError::into_inner).values_mut() {
             if let Some(cached) = entry
                 && cached.account_id == ctx.account_id
             {
@@ -194,7 +230,7 @@ impl RateLimiter {
     pub fn check(&self, account_id: &str, per_sec: u32) -> Result<(), u64> {
         let rate = f64::from(per_sec.max(1));
         let now = Instant::now();
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
         if !buckets.contains_key(account_id) {
             buckets.insert(account_id.to_owned(), (rate, now));
         }
@@ -366,7 +402,7 @@ impl UsageMeter {
     pub fn try_count(&self, ctx: &AuthContext, now: DateTime<Utc>) -> Result<Option<HourlyQuota>, Refusal> {
         let hour = hour_start(now);
         let month = month_start(now);
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let state = &mut *guard;
         if !state.accounts.contains_key(&ctx.account_id) {
             let at_lookup = |start, lookup_start, count| Counter {
@@ -443,7 +479,7 @@ impl UsageMeter {
 
     async fn flush_window(&self, pool: &PgPool, window: Window) -> Result<usize, sqlx::Error> {
         let mut batch: Batch = {
-            let mut guard = self.state.lock().unwrap();
+            let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             let state = &mut *guard;
             let mut batch = std::mem::take(state.ended(window));
             for (account, usage) in state.accounts.iter_mut() {
@@ -458,9 +494,12 @@ impl UsageMeter {
         if batch.is_empty() {
             return Ok(0);
         }
-        // A consistent row order keeps concurrent flushes from several
-        // instances from deadlocking.
-        batch.sort();
+        // One row per (account, window): a failed flush that straddled a
+        // window change can leave the same window in the batch twice, and
+        // the upsert refuses to touch a row twice in one statement. Sorted
+        // by key, which also keeps concurrent flushes from several instances
+        // from deadlocking.
+        batch = merge_batch(batch);
 
         let result = sqlx::query_as::<_, (String, DateTime<Utc>, i64)>(window.upsert_sql())
             .bind(batch.iter().map(|b| b.0.clone()).collect::<Vec<_>>())
@@ -469,7 +508,7 @@ impl UsageMeter {
             .fetch_all(pool)
             .await;
 
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let state = &mut *guard;
         match result {
             Ok(rows) => {
@@ -495,6 +534,15 @@ impl UsageMeter {
             }
         }
     }
+}
+
+/// Sum the counts of entries for the same (account, window start), sorted.
+fn merge_batch(batch: Batch) -> Batch {
+    let mut merged: std::collections::BTreeMap<(String, DateTime<Utc>), i64> = std::collections::BTreeMap::new();
+    for (account, start, count) in batch {
+        *merged.entry((account, start)).or_default() += count;
+    }
+    merged.into_iter().map(|((account, start), count)| (account, start, count)).collect()
 }
 
 pub fn spawn_usage_flusher(pool: PgPool, meter: Arc<UsageMeter>, interval: Duration) -> JoinHandle<()> {
@@ -566,7 +614,10 @@ fn hourly_limit_error(ctx: &AuthContext, quota: HourlyQuota, now: DateTime<Utc>)
     ApiError::too_many_requests("hourly_limit_exceeded", message, Some(seconds_until(quota.resets_at, now)))
 }
 
-pub async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<Admitted, Rejected> {
+/// Authenticate and check the account's status. When `counted`, also apply
+/// the per-second, hourly and monthly limits and count the request; requests
+/// that are not counted (imports) are checked for status only.
+pub async fn authorize(state: &AppState, headers: &HeaderMap, counted: bool) -> Result<Admitted, Rejected> {
     let token = bearer_token(headers).ok_or_else(|| {
         ApiError::unauthorized(
             "missing_api_key",
@@ -592,6 +643,9 @@ pub async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<Admitted
             format!("the free trial ended at {}", ends.to_rfc3339()),
         )
         .into());
+    }
+    if !counted {
+        return Ok(Admitted { ctx, hourly: None });
     }
     if let Some(rate) = ctx.rate_limit_per_sec
         && let Err(retry_after) = state.limiter.check(&ctx.account_id, rate.max(1) as u32)
@@ -639,7 +693,10 @@ pub async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<Admitted
 }
 
 pub async fn require_api_key(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
-    match authorize(&state, request.headers()).await {
+    // Moving customers over (`/v1/import`) is set-up, not usage: only the
+    // customers' own actions count toward the account's limits.
+    let counted = request.uri().path() != crate::import::ENDPOINT;
+    match authorize(&state, request.headers(), counted).await {
         Ok(Admitted { ctx, hourly }) => {
             request.extensions_mut().insert(ctx);
             let mut response = next.run(request).await;
@@ -663,6 +720,13 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
+
+    #[test]
+    fn a_batch_never_holds_the_same_window_twice() {
+        let (h10, h11) = (at(10, 0), at(11, 0));
+        let batch = vec![("b".into(), h10, 1), ("a".into(), h11, 4), ("a".into(), h10, 2), ("a".into(), h10, 5)];
+        assert_eq!(merge_batch(batch), vec![("a".into(), h10, 7), ("a".into(), h11, 4), ("b".into(), h10, 1)]);
+    }
 
     fn at(h: u32, m: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 11, 16, h, m, 0).unwrap()
@@ -765,7 +829,7 @@ mod tests {
         ctx.hourly_request_limit = None;
         ctx.monthly_request_limit = Some(4);
         assert_eq!(meter.try_count(&ctx, at(10, 0)), Ok(None));
-        let state = meter.state.lock().unwrap();
+        let state = meter.state.lock().unwrap_or_else(PoisonError::into_inner);
         let usage = &state.accounts["acct_test"];
         assert_eq!((usage.hour.pending, usage.month.pending), (1, 1));
     }
@@ -780,7 +844,7 @@ mod tests {
         // A request that read the clock just before the hour turned counts
         // in the new hour rather than reopening the old one.
         admit_unlimited(&meter, &ctx, at(10, 59), 1);
-        let state = meter.state.lock().unwrap();
+        let state = meter.state.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(state.ended_hours, vec![("acct_test".to_owned(), at(10, 0), 2)]);
         assert_eq!(state.accounts["acct_test"].hour.pending, 2);
         assert!(state.ended_months.is_empty());

@@ -457,9 +457,11 @@ async fn request_validation_and_not_found() {
     assert_eq!(missing_key.status, StatusCode::BAD_REQUEST);
     assert_eq!(missing_key.body["error"], "missing_idempotency_key");
 
+    // A tenant never granted anything has 0 credits: a reserve says so (402),
+    // the same as for an empty wallet. Reading the wallet is still a 404.
     let res = app.reserve(&tenant, 5, 60).await;
-    assert_eq!(res.status, StatusCode::NOT_FOUND);
-    assert_eq!(res.body["error"], "wallet_not_found");
+    assert_eq!(res.status, StatusCode::PAYMENT_REQUIRED, "{}", res.body);
+    assert_eq!((res.body["error"].clone(), res.body["available_credits"].clone()), (json!("insufficient_credits"), json!(0)));
 
     let res = app.get(&format!("/v1/tenants/{tenant}/wallet")).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);

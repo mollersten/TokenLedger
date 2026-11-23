@@ -8,8 +8,8 @@ use std::sync::Arc;
 use axum::{
     Extension, Json, Router,
     body::Bytes,
-    extract::{Path, State},
-    http::HeaderMap,
+    extract::{DefaultBodyLimit, Path, State},
+    http::{HeaderMap, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -18,14 +18,15 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::{
-    AppState,
+    AppState, accounts,
     auth::{self, AuthContext},
     error::ApiError,
-    idempotency, ledger,
+    idempotency, import, ledger,
     models::{CommitRequest, GrantRequest, ReleaseRequest, ReserveRequest, validate_tenant_id},
 };
 
 const RECENT_LEDGER_LIMIT: i64 = 20;
+const IMPORT_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 pub fn router(state: AppState) -> Router {
     let v1 = Router::new()
@@ -33,11 +34,18 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/credits/reserve", post(reserve))
         .route("/v1/credits/commit", post(commit))
         .route("/v1/credits/release", post(release))
+        // 100 tenants with 5 000 purchases and long keys can exceed axum's
+        // 2 MB default; this is still bounded by the counts in `import::parse`.
+        .route("/v1/import", post(import_tenants).layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
+        .route("/v1/settings", get(get_settings).patch(update_settings))
         .route("/v1/tenants/{tenant_id}/wallet", get(get_wallet))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_api_key));
     Router::new()
         .merge(v1)
+        // Readiness (can reach the database) vs. liveness (the process
+        // answers): a database blip should not get every instance restarted.
         .route("/healthz", get(health))
+        .route("/livez", get(|| async { Json(json!({ "status": "ok" })) }))
         .with_state(state)
 }
 
@@ -146,6 +154,9 @@ async fn execute(
         return idempotency::replay(stored, endpoint.path(), &hash);
     }
 
+    // Wait here, without a database connection, while this wallet already
+    // has requests in flight (see `gate`).
+    let _permit = state.gates.wallet(account_id, &tenant_id).await?;
     let mut tx = state.pool.begin().await?;
     let locked = match &mutation {
         Mutation::Grant(_) => Some(
@@ -155,8 +166,33 @@ async fn execute(
     };
     let Some(locked) = locked else {
         tx.rollback().await?;
+        // A tenant that was never granted anything has no wallet yet: to a
+        // reserve that means 0 credits, the same answer as an empty wallet
+        // (not stored for replay: there is no wallet to store it under).
+        if let Mutation::Reserve(req) = &mutation {
+            return Ok((
+                StatusCode::PAYMENT_REQUIRED,
+                Json(json!({
+                    "allowed": false,
+                    "error": "insufficient_credits",
+                    "available_credits": 0,
+                    "requested_credits": req.estimate_credits,
+                })),
+            )
+                .into_response());
+        }
         return Err(ApiError::wallet_not_found(&tenant_id));
     };
+    // An item reserve decides from the item's state, which a duplicate of
+    // this request (same key) may have just changed while we waited for the
+    // lock. Answer that duplicate's stored response rather than a conflict.
+    if let Mutation::Reserve(req) = &mutation
+        && req.item_key.is_some()
+        && let Some(stored) = idempotency::lookup(&mut *tx, account_id, &tenant_id, &key).await?
+    {
+        tx.rollback().await?;
+        return idempotency::replay(stored, endpoint.path(), &hash);
+    }
 
     let mut op = ledger::Op::begin(&mut tx, locked, endpoint.name()).await?;
     let outcome = match mutation {
@@ -213,6 +249,73 @@ async fn release(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     execute(&state, &caller, &headers, &body, Endpoint::Release).await
+}
+
+/// Move up to 100 tenants over from another billing system (see [`import`]).
+/// Answers 200 with a result per tenant, including the ones that failed.
+async fn import_tenants(
+    State(state): State<AppState>,
+    Extension(caller): Caller,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let key = idempotency::extract_key(&headers)?;
+    let value: Value = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request("invalid_json", format!("request body is not valid JSON: {e}")))?;
+    let tenants = import::parse(value)?;
+    // Imports are not limited in volume, only in how many run at once per
+    // account, so one client cannot occupy the pool with parallel imports.
+    let Some(_permit) = state.gates.imports.try_acquire(&caller.account_id) else {
+        return Err(ApiError::conflict(
+            "import_in_progress",
+            format!("{} imports are already running for this account; send the next one when they finish", crate::gate::IMPORT_PERMITS),
+            Some(1),
+        ));
+    };
+    import::check_caps(&state, &caller.account_id).await?;
+    Ok(Json(import::run(&state, &caller, &key, tenants).await?))
+}
+
+// ---------------------------------------------------------------------------
+// Account settings
+// ---------------------------------------------------------------------------
+
+fn settings_body(item_retention_days: Option<i32>) -> Json<Value> {
+    Json(json!({ "item_retention_days": item_retention_days }))
+}
+
+async fn get_settings(State(state): State<AppState>, Extension(caller): Caller) -> Result<Json<Value>, ApiError> {
+    Ok(settings_body(accounts::item_retention_days(&state.pool, &caller.account_id).await?))
+}
+
+/// `{"item_retention_days": 90}` makes owned items expire 90 days after they
+/// were bought (the next request for one is charged again); `null` keeps
+/// them forever. Takes effect at once.
+async fn update_settings(
+    State(state): State<AppState>,
+    Extension(caller): Caller,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let invalid = |message: String| ApiError::bad_request("invalid_settings", message);
+    let value: Value = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request("invalid_json", format!("request body is not valid JSON: {e}")))?;
+    let Value::Object(map) = value else {
+        return Err(invalid("expected an object".to_owned()));
+    };
+    if let Some(field) = map.keys().find(|k| k.as_str() != "item_retention_days") {
+        return Err(invalid(format!("unknown field `{field}`")));
+    }
+    let max = accounts::MAX_ITEM_RETENTION_DAYS;
+    let days = match map.get("item_retention_days") {
+        None => return Err(invalid("send item_retention_days (a number of days, or null for forever)".to_owned())),
+        Some(Value::Null) => None,
+        Some(v) => match v.as_i64() {
+            Some(d) if (1..=i64::from(max)).contains(&d) => Some(d as i32),
+            _ => return Err(invalid(format!("item_retention_days must be 1-{max} or null"))),
+        },
+    };
+    accounts::set_item_retention_days(&state.pool, &caller.account_id, days).await?;
+    Ok(settings_body(days))
 }
 
 // ---------------------------------------------------------------------------

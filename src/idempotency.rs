@@ -115,6 +115,26 @@ where
 
 /// Turn a stored response into the HTTP reply, or reject a mismatched reuse.
 pub fn replay(stored: StoredResponse, endpoint: &str, hash: &str) -> Result<Response, ApiError> {
+    check_reuse(&stored, endpoint, hash)?;
+    let status = u16::try_from(stored.response_status)
+        .ok()
+        .and_then(|s| StatusCode::from_u16(s).ok())
+        .ok_or_else(|| ApiError::internal("stored idempotency response has an invalid status"))?;
+    let mut response = (status, Json(stored.response_body)).into_response();
+    response
+        .headers_mut()
+        .insert(REPLAYED_HEADER, HeaderValue::from_static("true"));
+    Ok(response)
+}
+
+/// The stored body, for results replayed inside a larger response (one
+/// tenant of an import), after the same reuse checks as [`replay`].
+pub fn replay_body(stored: StoredResponse, endpoint: &str, hash: &str) -> Result<Value, ApiError> {
+    check_reuse(&stored, endpoint, hash)?;
+    Ok(stored.response_body)
+}
+
+fn check_reuse(stored: &StoredResponse, endpoint: &str, hash: &str) -> Result<(), ApiError> {
     if stored.endpoint != endpoint {
         return Err(ApiError::unprocessable(
             "idempotency_key_reused",
@@ -130,15 +150,66 @@ pub fn replay(stored: StoredResponse, endpoint: &str, hash: &str) -> Result<Resp
             "this Idempotency-Key was already used with a different request body",
         ));
     }
-    let status = u16::try_from(stored.response_status)
-        .ok()
-        .and_then(|s| StatusCode::from_u16(s).ok())
-        .ok_or_else(|| ApiError::internal("stored idempotency response has an invalid status"))?;
-    let mut response = (status, Json(stored.response_body)).into_response();
-    response
-        .headers_mut()
-        .insert(REPLAYED_HEADER, HeaderValue::from_static("true"));
-    Ok(response)
+    Ok(())
+}
+
+/// How long idempotency records are kept by default. A retry of the same
+/// request within this window replays its answer; after it, the request is
+/// decided afresh. Charging once per item does not depend on these records
+/// (`wallets_items` does), so this never lets an item be charged twice.
+pub const DEFAULT_RETENTION: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// How often the server prunes them.
+pub const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+const PRUNE_BATCH: i64 = 5_000;
+
+/// Delete records older than `retention`, in batches so no statement holds
+/// many row locks or runs long. Returns how many were deleted.
+pub async fn prune(pool: &sqlx::PgPool, retention: std::time::Duration) -> Result<u64, sqlx::Error> {
+    let mut deleted = 0;
+    loop {
+        let n = sqlx::query(
+            "DELETE FROM idempotency_keys WHERE ctid = ANY (ARRAY( \
+               SELECT ctid FROM idempotency_keys \
+               WHERE created_at < NOW() - make_interval(secs => $1) LIMIT $2))",
+        )
+        .bind(retention.as_secs_f64())
+        .bind(PRUNE_BATCH)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        deleted += n;
+        if n < PRUNE_BATCH as u64 {
+            return Ok(deleted);
+        }
+    }
+}
+
+/// Every `interval`: prune idempotency records past `retention` (if set)
+/// and owned items past their account's `item_retention_days`.
+pub fn spawn_pruner(
+    pool: sqlx::PgPool,
+    retention: Option<std::time::Duration>,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Some(retention) = retention {
+                match prune(&pool, retention).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(deleted = n, "pruned old idempotency records"),
+                    Err(err) => tracing::warn!(error = %err, "pruning idempotency records failed; will retry"),
+                }
+            }
+            match crate::ledger::prune_expired_items(&pool).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(deleted = n, "pruned expired owned items"),
+                Err(err) => tracing::warn!(error = %err, "pruning expired owned items failed; will retry"),
+            }
+        }
+    })
 }
 
 #[cfg(test)]

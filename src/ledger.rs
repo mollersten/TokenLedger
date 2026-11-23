@@ -31,10 +31,40 @@
 //! expiring credits live in buckets (one per grant with `expires_at`).
 //! Spending (reserve, overage) takes from buckets first, soonest expiry
 //! first, then from permanent credits. A reservation remembers which buckets
-//! funded it (`bucket_holds`); unused credits go back to those buckets, and
+//! funded it (`reservations_credit_buckets`); unused credits go back to those buckets, and
 //! a part whose bucket expired in the meantime is expired on return. Due
 //! buckets are expired by the reaper, and also by any request that locks the
 //! wallet after `next_expiry_at`, so expired credits can never be spent.
+//!
+//! # Charging once per item
+//!
+//! A reserve can name the item it pays for (`item_key` under its `feature`).
+//! Items are stored once per account (`items`); a tenant owns an item when
+//! `wallets_items` has a row for the pair. Reserving an owned item answers
+//! `already_charged` and moves no credits. Per tenant and item at most one
+//! reservation is PENDING (a partial unique index backs this up); while it
+//! is, another reserve is refused with `item_charge_in_progress` until it is
+//! committed, released or past its TTL. Committing it (with at least 1
+//! credit) writes the `wallets_items` row in the same statement, so a failed,
+//! released or expired attempt never leaves the item owned.
+//!
+//! # What is stored twice, on purpose
+//!
+//! The schema is normalized except where a derived value saves reading or
+//! summing history on every request:
+//! - `wallets.available_credits` / `reserved_credits` / `expiring_credits` /
+//!   `next_expiry_at`: sums over the ledger, pending reservations and live
+//!   buckets. They are the row every write locks, so checks are O(1).
+//! - `ledger_entries.balance_*_after`: running balances, so a statement needs
+//!   no window over the whole history (and the trail is self-checking).
+//! - `credit_buckets.remaining`: granted minus what moved out, so spending
+//!   reads one row per bucket.
+//! - `reservations.committed_amount`, `wallets_items.credits_paid`: what was
+//!   charged, without summing ledger entries (and for imported purchases
+//!   there are no entries).
+//! - `idempotency_keys.response_body`: the stored answer is the point.
+//!
+//! The tests reconcile each of these against its source.
 //!
 //! Ledger entry conventions (deltas apply to the wallet in order; each entry
 //! records the balances right after it):
@@ -56,13 +86,13 @@ use std::collections::BTreeMap;
 use axum::http::StatusCode;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::{Map, Value, json};
-use sqlx::{PgConnection, Postgres, QueryBuilder, Row, types::Json};
+use sqlx::{PgConnection, Postgres, QueryBuilder, Row};
 use uuid::Uuid;
 
 use crate::{
     error::ApiError,
     models::{
-        BucketHold, CommitRequest, CreditBucket, EntryType, GrantRequest, LEDGER_COLUMNS, LedgerEntry,
+        BucketHold, CommitRequest, CreditBucket, EntryType, GrantRequest, LEDGER_COLUMNS, LedgerEntry, MAX_CREDITS,
         Outcome, RESERVATION_COLUMNS, ReleaseRequest, Reservation, ReservationStatus, ReserveRequest,
         WALLET_COLUMNS, Wallet,
     },
@@ -181,6 +211,73 @@ async fn read_reservation(
     .await
 }
 
+/// An item that exists for the account, and whether this wallet owns it:
+/// (item id, credits paid, when, the reservation that paid if not imported).
+type ItemRow = (i64, Option<i64>, Option<DateTime<Utc>>, Option<Uuid>);
+
+async fn read_item(
+    conn: &mut PgConnection,
+    wallet: &Wallet,
+    feature: &str,
+    item_key: &str,
+) -> Result<Option<ItemRow>, sqlx::Error> {
+    // Owned means a wallets_items row inside the account's retention, if it
+    // has one: an older purchase is expired even before it is pruned.
+    sqlx::query_as(
+        "SELECT i.id, wi.credits_paid, wi.created_at, wi.reservation_id FROM items i \
+         JOIN accounts a ON a.id = i.account_id \
+         LEFT JOIN wallets_items wi ON wi.item_id = i.id AND wi.wallet_id = $4 \
+           AND (a.item_retention_days IS NULL \
+                OR wi.created_at > NOW() - make_interval(days => a.item_retention_days)) \
+         WHERE i.account_id = $1 AND i.feature = $2 AND i.item_key = $3",
+    )
+    .bind(&wallet.account_id)
+    .bind(feature)
+    .bind(item_key)
+    .bind(wallet.id)
+    .fetch_optional(conn)
+    .await
+}
+
+/// The item's id, creating the item on first use. Items are shared by the
+/// account's tenants, so another tenant may create it at the same moment:
+/// the upsert returns the one row either way.
+async fn create_item(
+    conn: &mut PgConnection,
+    account_id: &str,
+    feature: &str,
+    item_key: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO items (account_id, feature, item_key) VALUES ($1, $2, $3) \
+         ON CONFLICT (account_id, feature, item_key) DO UPDATE SET item_key = EXCLUDED.item_key \
+         RETURNING id",
+    )
+    .bind(account_id)
+    .bind(feature)
+    .bind(item_key)
+    .fetch_one(conn)
+    .await
+}
+
+/// The reservation charging this wallet for the item right now, if any (the
+/// partial unique index allows at most one).
+async fn pending_item_reservation(
+    conn: &mut PgConnection,
+    wallet: &Wallet,
+    item_id: i64,
+) -> Result<Option<Reservation>, sqlx::Error> {
+    sqlx::query_as::<_, Reservation>(&format!(
+        "SELECT {RESERVATION_COLUMNS} FROM reservations \
+         WHERE account_id = $1 AND tenant_id = $2 AND item_id = $3 AND status = 'PENDING'"
+    ))
+    .bind(&wallet.account_id)
+    .bind(&wallet.tenant_id)
+    .bind(item_id)
+    .fetch_optional(conn)
+    .await
+}
+
 /// A bucket with credits left, in spend order.
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct LiveBucket {
@@ -211,7 +308,11 @@ struct Movement {
     delta_reserved: i64,
     reservation_id: Option<Uuid>,
     bucket_id: Option<Uuid>,
+    /// Facts about this event only; what the reservation or bucket already
+    /// records is not repeated.
     metadata: Value,
+    /// The buckets the credits moved from or to (`ledger_entries_credit_buckets`).
+    parts: Vec<BucketHold>,
 }
 
 #[derive(Debug)]
@@ -225,6 +326,7 @@ struct LedgerRow {
     balance_available_after: i64,
     balance_reserved_after: i64,
     metadata: Value,
+    parts: Vec<BucketHold>,
 }
 
 #[derive(Debug)]
@@ -235,6 +337,15 @@ struct NewReservation {
     expires_at: DateTime<Utc>,
     metadata: Value,
     bucket_holds: Vec<BucketHold>,
+    item_id: Option<i64>,
+}
+
+/// A wallet now owns an item it paid for (written when the charge commits).
+#[derive(Debug)]
+struct NewWalletItem {
+    item_id: i64,
+    credits_paid: i64,
+    reservation_id: Uuid,
 }
 
 #[derive(Debug)]
@@ -242,7 +353,6 @@ struct ReservationUpdate {
     id: Uuid,
     status: ReservationStatus,
     committed_amount: Option<i64>,
-    merge_metadata: Value,
 }
 
 #[derive(Debug)]
@@ -271,6 +381,7 @@ struct WriteSet {
     wallet_changed: bool,
     new_reservation: Option<NewReservation>,
     reservation_update: Option<ReservationUpdate>,
+    new_wallet_item: Option<NewWalletItem>,
     new_bucket: Option<NewBucket>,
     /// Net change to each existing bucket's `remaining`.
     bucket_deltas: BTreeMap<Uuid, i64>,
@@ -288,6 +399,7 @@ impl WriteSet {
             wallet_changed: false,
             new_reservation: None,
             reservation_update: None,
+            new_wallet_item: None,
             new_bucket: None,
             bucket_deltas: BTreeMap::new(),
             settle_due_buckets: false,
@@ -368,8 +480,7 @@ impl WriteSet {
         if let Some(r) = &self.new_reservation {
             qb.push(
                 ", ri AS (INSERT INTO reservations \
-                   (id, account_id, tenant_id, feature, reserved_amount, status, expires_at, metadata, \
-                    bucket_holds) \
+                   (id, account_id, tenant_id, feature, reserved_amount, status, expires_at, metadata, item_id) \
                  SELECT ",
             );
             qb.push_bind(r.id).push(", ");
@@ -379,8 +490,16 @@ impl WriteSet {
             qb.push_bind(r.reserved_amount).push(", 'PENDING', ");
             qb.push_bind(r.expires_at).push(", ");
             qb.push_bind(&r.metadata).push(", ");
-            qb.push_bind(Json(&r.bucket_holds));
+            qb.push_bind(r.item_id);
             qb.push(" WHERE EXISTS (SELECT 1 FROM gate) RETURNING 1)");
+            if !r.bucket_holds.is_empty() {
+                qb.push(", rb AS (INSERT INTO reservations_credit_buckets (reservation_id, bucket_id, amount) SELECT ");
+                qb.push_bind(r.id);
+                qb.push(", t.b, t.a FROM UNNEST(");
+                qb.push_bind(r.bucket_holds.iter().map(|h| h.bucket_id).collect::<Vec<_>>()).push("::uuid[], ");
+                qb.push_bind(r.bucket_holds.iter().map(|h| h.amount).collect::<Vec<_>>()).push("::int8[]");
+                qb.push(") AS t(b, a) WHERE EXISTS (SELECT 1 FROM gate) RETURNING 1)");
+            }
         }
 
         if let Some(u) = &self.reservation_update {
@@ -388,11 +507,24 @@ impl WriteSet {
             qb.push_bind(u.status.as_str());
             qb.push(", committed_amount = COALESCE(");
             qb.push_bind(u.committed_amount);
-            qb.push("::bigint, committed_amount), metadata = metadata || ");
-            qb.push_bind(&u.merge_metadata);
-            qb.push("::jsonb, updated_at = NOW() WHERE id = ");
+            qb.push("::bigint, committed_amount), updated_at = NOW() WHERE id = ");
             qb.push_bind(u.id);
             qb.push(" AND status = 'PENDING' AND EXISTS (SELECT 1 FROM gate) RETURNING 1)");
+        }
+
+        if let Some(wi) = &self.new_wallet_item {
+            // A row still there for this pair is an expired purchase not yet
+            // pruned (the reserve checked that under this same lock): replace it.
+            qb.push(", wi AS (INSERT INTO wallets_items (wallet_id, item_id, credits_paid, reservation_id) SELECT ");
+            qb.push_bind(wallet.id).push(", ");
+            qb.push_bind(wi.item_id).push(", ");
+            qb.push_bind(wi.credits_paid).push(", ");
+            qb.push_bind(wi.reservation_id);
+            qb.push(
+                " WHERE EXISTS (SELECT 1 FROM gate) \
+                 ON CONFLICT (wallet_id, item_id) DO UPDATE SET credits_paid = EXCLUDED.credits_paid, \
+                   reservation_id = EXCLUDED.reservation_id, created_at = NOW() RETURNING 1)",
+            );
         }
 
         if let Some(b) = &self.new_bucket {
@@ -479,6 +611,15 @@ impl WriteSet {
                 ") WITH ORDINALITY AS t(id, reservation_id, bucket_id, entry_type, da, dr, ba, br, metadata, ord) \
                  WHERE EXISTS (SELECT 1 FROM gate) RETURNING 1)",
             );
+            let parts: Vec<(Uuid, &BucketHold)> =
+                rows.iter().flat_map(|r| r.parts.iter().filter(|p| p.amount > 0).map(move |p| (r.id, p))).collect();
+            if !parts.is_empty() {
+                qb.push(", lb AS (INSERT INTO ledger_entries_credit_buckets (ledger_entry_id, bucket_id, amount) SELECT * FROM UNNEST(");
+                qb.push_bind(parts.iter().map(|(id, _)| *id).collect::<Vec<_>>()).push("::uuid[], ");
+                qb.push_bind(parts.iter().map(|(_, p)| p.bucket_id).collect::<Vec<_>>()).push("::uuid[], ");
+                qb.push_bind(parts.iter().map(|(_, p)| p.amount).collect::<Vec<_>>()).push("::int8[]");
+                qb.push(") WHERE EXISTS (SELECT 1 FROM gate) RETURNING 1)");
+            }
         }
 
         qb.push(" SELECT EXISTS (SELECT 1 FROM gate) AS applied");
@@ -487,13 +628,21 @@ impl WriteSet {
             qb.push(", (SELECT COUNT(*) FROM w) AS w");
             expected.push(("w", 1));
         }
-        if self.new_reservation.is_some() {
+        if let Some(r) = &self.new_reservation {
             qb.push(", (SELECT COUNT(*) FROM ri) AS ri");
             expected.push(("ri", 1));
+            if !r.bucket_holds.is_empty() {
+                qb.push(", (SELECT COUNT(*) FROM rb) AS rb");
+                expected.push(("rb", r.bucket_holds.len() as i64));
+            }
         }
         if self.reservation_update.is_some() {
             qb.push(", (SELECT COUNT(*) FROM ru) AS ru");
             expected.push(("ru", 1));
+        }
+        if self.new_wallet_item.is_some() {
+            qb.push(", (SELECT COUNT(*) FROM wi) AS wi");
+            expected.push(("wi", 1));
         }
         if self.new_bucket.is_some() {
             qb.push(", (SELECT COUNT(*) FROM bi) AS bi");
@@ -506,6 +655,11 @@ impl WriteSet {
         if !self.ledger.is_empty() {
             qb.push(", (SELECT COUNT(*) FROM l) AS l");
             expected.push(("l", self.ledger.len() as i64));
+            let parts = self.ledger.iter().flat_map(|r| &r.parts).filter(|p| p.amount > 0).count();
+            if parts > 0 {
+                qb.push(", (SELECT COUNT(*) FROM lb) AS lb");
+                expected.push(("lb", parts as i64));
+            }
         }
 
         let row = qb.build().fetch_one(&mut *conn).await?;
@@ -619,6 +773,7 @@ impl Op {
             balance_available_after: available,
             balance_reserved_after: reserved,
             metadata: movement.metadata,
+            parts: movement.parts,
         });
         wallet.available_credits = available;
         wallet.reserved_credits = reserved;
@@ -700,7 +855,8 @@ impl Op {
                 delta_reserved: 0,
                 reservation_id: None,
                 bucket_id: Some(bucket.id),
-                metadata: json!({ "source": source, "expires_at": bucket.expires_at }),
+                metadata: json!({ "source": source }),
+                parts: Vec::new(),
             })?;
         }
         self.refresh_next_expiry();
@@ -756,11 +912,8 @@ impl Op {
                     delta_reserved: 0,
                     reservation_id: Some(reservation_id),
                     bucket_id: Some(part.bucket_id),
-                    metadata: json!({
-                        "source": source,
-                        "expires_at": part.expires_at,
-                        "returned_from_hold": true,
-                    }),
+                    metadata: json!({ "source": source, "returned_from_hold": true }),
+                    parts: Vec::new(),
                 })?;
                 expired += part.amount;
             }
@@ -788,20 +941,6 @@ fn split_hold(holds: &[BucketHold], consume: i64) -> (Vec<BucketHold>, Vec<Bucke
     (consumed, unused)
 }
 
-/// Adds `"buckets": [...]` to ledger metadata when credits moved to or from
-/// buckets, so the audit trail shows which grant paid for what.
-fn with_buckets(mut metadata: Value, parts: &[BucketHold]) -> Value {
-    if !parts.is_empty()
-        && let Some(object) = metadata.as_object_mut()
-    {
-        object.insert(
-            "buckets".to_owned(),
-            parts.iter().map(|p| json!({ "bucket_id": p.bucket_id, "amount": p.amount })).collect(),
-        );
-    }
-    metadata
-}
-
 /// Return a PENDING reservation's hold to `available_credits` (and its
 /// buckets) and mark it EXPIRED. Used by the reaper and lazily by
 /// commit/release on overdue holds.
@@ -813,21 +952,14 @@ pub fn expire_reservation(op: &mut Op, reservation: &Reservation, source: &str) 
         delta_reserved: -reservation.reserved_amount,
         reservation_id: Some(reservation.id),
         bucket_id: None,
-        metadata: with_buckets(
-            json!({
-                "source": source,
-                "feature": reservation.feature,
-                "expires_at": reservation.expires_at,
-            }),
-            holds,
-        ),
+        metadata: json!({ "source": source }),
+        parts: holds.clone(),
     })?;
     op.return_to_buckets(holds, reservation.id, source)?;
     op.writes.update_reservation(ReservationUpdate {
         id: reservation.id,
         status: ReservationStatus::Expired,
         committed_amount: None,
-        merge_metadata: json!({}),
     })
 }
 
@@ -889,7 +1021,9 @@ async fn pending_reservation(
 }
 
 pub fn grant(op: &mut Op, req: GrantRequest) -> Result<Outcome, ApiError> {
-    if op.wallet.available_credits.checked_add(req.amount).is_none() {
+    // Past MAX_CREDITS a balance can no longer be read exactly by a JavaScript
+    // client (the SDK), so refuse before getting there.
+    if op.wallet.available_credits.checked_add(req.amount).is_none_or(|total| total > MAX_CREDITS) {
         return Ok(Outcome::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             json!({
@@ -908,10 +1042,8 @@ pub fn grant(op: &mut Op, req: GrantRequest) -> Result<Outcome, ApiError> {
     }
 
     let bucket_id = req.expires_at.map(|_| Uuid::new_v4());
-    let mut metadata = json!({ "reason": req.reason, "metadata": object(req.metadata) });
-    if let Some(expires_at) = req.expires_at {
-        metadata["expires_at"] = json!(expires_at);
-    }
+    // The expiry is the bucket's; the entry keeps only what the grant said.
+    let metadata = json!({ "reason": req.reason, "metadata": object(req.metadata) });
     let entry_id = op.movement(Movement {
         entry_type: EntryType::Grant,
         delta_available: req.amount,
@@ -919,6 +1051,7 @@ pub fn grant(op: &mut Op, req: GrantRequest) -> Result<Outcome, ApiError> {
         reservation_id: None,
         bucket_id,
         metadata,
+        parts: Vec::new(),
     })?;
     if let (Some(id), Some(expires_at)) = (bucket_id, req.expires_at) {
         op.writes.new_bucket = Some(NewBucket { id, granted: req.amount, expires_at, reason: req.reason });
@@ -946,7 +1079,69 @@ pub fn grant(op: &mut Op, req: GrantRequest) -> Result<Outcome, ApiError> {
     Ok(Outcome::ok(body))
 }
 
+/// Before reserving for an item: answer `already_charged` if the tenant owns
+/// it, refuse while another reservation is charging it, and expire that
+/// reservation first if it is past its TTL (it paid nothing). Otherwise
+/// returns the item's id to reserve for, or `None` if the account has no
+/// such item yet (the caller creates it only once the hold is allowed, so a
+/// refused reserve leaves no item behind).
+///
+/// Everything here runs under the wallet lock, which every writer of this
+/// tenant's reservations and items holds, so the answer cannot change before
+/// the new reservation is written.
+async fn check_item(
+    conn: &mut PgConnection,
+    op: &mut Op,
+    req: &ReserveRequest,
+    item_key: &str,
+) -> Result<Result<Option<i64>, Outcome>, ApiError> {
+    let Some((item_id, paid, paid_at, paid_by)) = read_item(conn, &op.wallet, &req.feature, item_key).await? else {
+        return Ok(Ok(None));
+    };
+    if let Some(credits) = paid {
+        return Ok(Err(Outcome::ok(json!({
+            "allowed": true,
+            "already_charged": true,
+            "item_key": item_key,
+            "feature": req.feature,
+            // Null when the purchase was imported from another system.
+            "reservation_id": paid_by,
+            "charged_credits": credits,
+            "charged_at": paid_at,
+            "remaining_available": op.wallet.available_credits,
+            "reserved_balance": op.wallet.reserved_credits,
+        }))));
+    }
+    let Some(existing) = pending_item_reservation(conn, &op.wallet, item_id).await? else {
+        return Ok(Ok(Some(item_id)));
+    };
+    if existing.expires_at >= op.now {
+        // Concurrent requests for one item: one pays, the others wait for it
+        // instead of getting the item before anyone has paid.
+        let wait = (existing.expires_at - op.now).num_seconds().max(1) as u64;
+        return Err(ApiError::conflict(
+            "item_charge_in_progress",
+            format!(
+                "item_key '{item_key}' is being charged by reservation {}; retry once it is committed or released",
+                existing.id
+            ),
+            Some(wait),
+        ));
+    }
+    // Past its TTL: return the hold (as the reaper would), then reserve anew.
+    expire_reservation(op, &existing, "reserve")?;
+    op.flush(conn).await?;
+    Ok(Ok(Some(item_id)))
+}
+
 pub async fn reserve(conn: &mut PgConnection, op: &mut Op, req: ReserveRequest) -> Result<Outcome, ApiError> {
+    let known_item = match req.item_key.clone() {
+        Some(item_key) => match check_item(conn, op, &req, &item_key).await? {
+            Ok(item_id) => item_id,
+            Err(outcome) => return Ok(outcome),
+        },
+        None => None,
+    };
     let estimate = req.estimate_credits;
     if op.wallet.available_credits < estimate {
         return Ok(Outcome::new(
@@ -960,18 +1155,37 @@ pub async fn reserve(conn: &mut PgConnection, op: &mut Op, req: ReserveRequest) 
         ));
     }
 
+    // First hold for an item the account has never seen: create it now.
+    let item_id = match (&req.item_key, known_item) {
+        (Some(item_key), None) => Some(create_item(conn, &op.wallet.account_id, &req.feature, item_key).await?),
+        (_, known) => known,
+    };
+
     let reservation_id = Uuid::new_v4();
     let ttl = req.ttl();
     let expires_at = op.now + ChronoDuration::seconds(ttl);
     let holds = op.spend(conn, estimate).await?;
+    // Feature, TTL and item are the reservation's; the entry repeats none of them.
     op.movement(Movement {
         entry_type: EntryType::Reserve,
         delta_available: -estimate,
         delta_reserved: estimate,
         reservation_id: Some(reservation_id),
         bucket_id: None,
-        metadata: with_buckets(json!({ "feature": req.feature, "ttl_seconds": ttl }), &holds),
+        metadata: json!({}),
+        parts: holds.clone(),
     })?;
+    let mut body = json!({
+        "allowed": true,
+        "reservation_id": reservation_id,
+        "remaining_available": op.wallet.available_credits,
+        "reserved_balance": op.wallet.reserved_credits,
+        "expires_at": expires_at,
+    });
+    if let Some(item_key) = &req.item_key {
+        body["already_charged"] = json!(false);
+        body["item_key"] = json!(item_key);
+    }
     op.writes.insert_reservation(NewReservation {
         id: reservation_id,
         feature: req.feature,
@@ -979,15 +1193,10 @@ pub async fn reserve(conn: &mut PgConnection, op: &mut Op, req: ReserveRequest) 
         expires_at,
         metadata: object(req.metadata),
         bucket_holds: holds,
+        item_id,
     })?;
 
-    Ok(Outcome::ok(json!({
-        "allowed": true,
-        "reservation_id": reservation_id,
-        "remaining_available": op.wallet.available_credits,
-        "reserved_balance": op.wallet.reserved_credits,
-        "expires_at": expires_at,
-    })))
+    Ok(Outcome::ok(body))
 }
 
 pub async fn commit(conn: &mut PgConnection, op: &mut Op, req: CommitRequest) -> Result<Outcome, ApiError> {
@@ -998,6 +1207,14 @@ pub async fn commit(conn: &mut PgConnection, op: &mut Op, req: CommitRequest) ->
 
     let held = reservation.reserved_amount;
     let actual = req.actual_credits_used;
+    // A committed item counts as paid for good, so it must actually be paid:
+    // committing 0 would hand the tenant that item free from then on.
+    if reservation.item_id.is_some() && actual == 0 {
+        return Err(ApiError::unprocessable(
+            "invalid_actual_credits_used",
+            "an item charge must be committed with at least 1 credit; release it to charge nothing",
+        ));
+    }
     let consumed_from_hold = actual.min(held);
     let refund = held - consumed_from_hold;
     let overage = actual - consumed_from_hold;
@@ -1024,15 +1241,14 @@ pub async fn commit(conn: &mut PgConnection, op: &mut Op, req: CommitRequest) ->
         delta_reserved: -consumed_from_hold,
         reservation_id: Some(reservation.id),
         bucket_id: None,
-        metadata: with_buckets(
-            json!({
-                "feature": reservation.feature,
-                "reserved_amount": held,
-                "actual_credits_used": actual,
-                "metadata": client_metadata,
-            }),
-            &consumed_parts,
-        ),
+        // The amounts follow from the deltas and the reservation; what the
+        // caller sent with the commit is this event's own.
+        metadata: if client_metadata.as_object().is_some_and(|m| !m.is_empty()) {
+            json!({ "metadata": client_metadata })
+        } else {
+            json!({})
+        },
+        parts: consumed_parts,
     })?;
     let mut expired = 0;
     if refund > 0 {
@@ -1042,10 +1258,8 @@ pub async fn commit(conn: &mut PgConnection, op: &mut Op, req: CommitRequest) ->
             delta_reserved: -refund,
             reservation_id: Some(reservation.id),
             bucket_id: None,
-            metadata: with_buckets(
-                json!({ "reserved_amount": held, "actual_credits_used": actual }),
-                &unused_parts,
-            ),
+            metadata: json!({}),
+            parts: unused_parts.clone(),
         })?;
         expired = op.return_to_buckets(&unused_parts, reservation.id, "commit")?;
     }
@@ -1057,15 +1271,20 @@ pub async fn commit(conn: &mut PgConnection, op: &mut Op, req: CommitRequest) ->
             delta_reserved: 0,
             reservation_id: Some(reservation.id),
             bucket_id: None,
-            metadata: with_buckets(json!({ "reserved_amount": held, "actual_credits_used": actual }), &parts),
+            metadata: json!({}),
+            parts,
         })?;
     }
     op.writes.update_reservation(ReservationUpdate {
         id: reservation.id,
         status: ReservationStatus::Committed,
         committed_amount: Some(actual),
-        merge_metadata: client_metadata,
     })?;
+    // Paid: the wallet owns the item from now on, written in the same
+    // statement as the charge itself.
+    if let Some(item_id) = reservation.item_id {
+        op.writes.new_wallet_item = Some(NewWalletItem { item_id, credits_paid: actual, reservation_id: reservation.id });
+    }
 
     Ok(Outcome::ok(json!({
         "reservation_id": reservation.id,
@@ -1094,17 +1313,17 @@ pub async fn release(conn: &mut PgConnection, op: &mut Op, req: ReleaseRequest) 
         delta_reserved: -held,
         reservation_id: Some(reservation.id),
         bucket_id: None,
-        metadata: with_buckets(json!({ "feature": reservation.feature, "reason": req.reason }), holds),
+        metadata: match &req.reason {
+            Some(reason) => json!({ "reason": reason }),
+            None => json!({}),
+        },
+        parts: holds.clone(),
     })?;
     let expired = op.return_to_buckets(holds, reservation.id, "release")?;
     op.writes.update_reservation(ReservationUpdate {
         id: reservation.id,
         status: ReservationStatus::Released,
         committed_amount: None,
-        merge_metadata: match &req.reason {
-            Some(reason) => json!({ "release_reason": reason }),
-            None => json!({}),
-        },
     })?;
 
     Ok(Outcome::ok(json!({
@@ -1116,6 +1335,44 @@ pub async fn release(conn: &mut PgConnection, op: &mut Op, req: ReleaseRequest) 
         "reserved_credits": op.wallet.reserved_credits,
         "expiring_credits": op.wallet.expiring_credits,
     })))
+}
+
+/// Days an expired owned item is kept before the row is deleted. Until then
+/// the account can raise `item_retention_days` (or clear it) and the item is
+/// owned again; charges treat it as expired either way.
+pub const ITEM_DELETE_GRACE_DAYS: i32 = 7;
+
+/// Delete owned items past their account's `item_retention_days` plus
+/// [`ITEM_DELETE_GRACE_DAYS`], account by account and in batches, using the
+/// `created_at` index. Returns how many were deleted.
+pub async fn prune_expired_items(pool: &sqlx::PgPool) -> Result<u64, sqlx::Error> {
+    const BATCH: i64 = 5_000;
+    let accounts: Vec<(String, i32)> =
+        sqlx::query_as("SELECT id, item_retention_days FROM accounts WHERE item_retention_days IS NOT NULL")
+            .fetch_all(pool)
+            .await?;
+    let mut deleted = 0;
+    for (account_id, days) in accounts {
+        loop {
+            let n = sqlx::query(
+                "DELETE FROM wallets_items WHERE ctid = ANY (ARRAY( \
+                   SELECT wi.ctid FROM wallets_items wi JOIN wallets w ON w.id = wi.wallet_id \
+                   WHERE w.account_id = $1 AND wi.created_at <= NOW() - make_interval(days => $2) \
+                   LIMIT $3))",
+            )
+            .bind(&account_id)
+            .bind(days + ITEM_DELETE_GRACE_DAYS)
+            .bind(BATCH)
+            .execute(pool)
+            .await?
+            .rows_affected();
+            deleted += n;
+            if n < BATCH as u64 {
+                break;
+            }
+        }
+    }
+    Ok(deleted)
 }
 
 // ---------------------------------------------------------------------------
@@ -1171,8 +1428,9 @@ pub async fn recent_ledger(
     limit: i64,
 ) -> Result<Vec<LedgerEntry>, sqlx::Error> {
     sqlx::query_as::<_, LedgerEntry>(&format!(
-        "SELECT {LEDGER_COLUMNS} FROM ledger_entries WHERE account_id = $1 AND tenant_id = $2 \
-         ORDER BY created_at DESC, id DESC LIMIT $3"
+        "SELECT {LEDGER_COLUMNS} FROM ledger_entries l LEFT JOIN reservations r ON r.id = l.reservation_id \
+         WHERE l.account_id = $1 AND l.tenant_id = $2 \
+         ORDER BY l.created_at DESC, l.id DESC LIMIT $3"
     ))
     .bind(account_id)
     .bind(tenant_id)

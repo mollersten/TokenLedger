@@ -67,14 +67,11 @@ async fn accounts_are_fully_isolated() {
 
     // A reservation id from account A means nothing to account B.
     let id = reservation_id(&app.reserve(tenant, 10, 300).await);
-    for path in ["/v1/credits/commit", "/v1/credits/release"] {
-        let res = post(
-            &other,
-            path,
-            &new_key(),
-            json!({ "tenant_id": tenant, "reservation_id": id, "actual_credits_used": 1 }),
-        )
-        .await;
+    for (path, body) in [
+        ("/v1/credits/commit", json!({ "tenant_id": tenant, "reservation_id": id, "actual_credits_used": 1 })),
+        ("/v1/credits/release", json!({ "tenant_id": tenant, "reservation_id": id })),
+    ] {
+        let res = post(&other, path, &new_key(), body).await;
         assert_eq!(res.status, StatusCode::NOT_FOUND, "{path}: {}", res.body);
         assert_eq!(res.body["error"], "reservation_not_found");
     }

@@ -1,8 +1,10 @@
 //! Account and API key administration for TokenLedger.
 //!
 //! Uses DATABASE_URL (from the environment or backend/.env, where it points at
-//! the real database on Supabase) and applies any pending migrations first.
-//! Prints the database it uses to stderr when it connects. To work on the
+//! the real database on Supabase). Prints the database it uses to stderr when
+//! it connects. It never migrates on its own: the server applies migrations
+//! when it starts (deploy), and `migrate` does it by hand. If the database is
+//! behind this build, it says so when it connects. To work on the
 //! local database instead, prefix the command with `scripts/with-local-db.sh`.
 //!
 //! With no arguments it opens an interactive shell: it connects once, then
@@ -58,6 +60,9 @@ Commands:
       has not started).
   reset-grace   --account ID
       Lets the next request over the hourly limit start a new grace period.
+  migrate       [--yes]
+      Applies pending migrations. Needs --yes on a database that is not on
+      this machine (normally the server applies them when it is deployed).
 
 Changes reach running servers within their auth cache TTL (30 s default).
 Values with spaces need quotes: --name \"Acme AI\".";
@@ -166,15 +171,44 @@ fn limit_change(flags: &Flags) -> Result<LimitChange, String> {
     })
 }
 
-/// Connects to DATABASE_URL and applies pending migrations. Returns the pool
-/// and the URL (for the shell prompt).
+/// Connects to DATABASE_URL and warns if migrations are pending (it does
+/// not apply them: running the admin CLI from a newer checkout must not
+/// change production ahead of a deploy). Returns the pool and the URL (for
+/// the shell prompt).
 async fn connect() -> Result<(PgPool, String), String> {
     let _ = dotenvy::dotenv();
     let url = std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set".to_owned())?;
     eprintln!("database: {}", backend::database_label(&url));
     let pool = backend::connect(&url, 2).await.map_err(|e| format!("cannot connect: {e}"))?;
-    backend::MIGRATOR.run(&pool).await.map_err(|e| format!("migrations failed: {e}"))?;
+    let pending = pending_migrations(&pool).await?;
+    if !pending.is_empty() {
+        let list = pending.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
+        eprintln!(
+            "warning: the database is missing migrations {list}; commands that need them will fail. \
+             Deploy the server (it migrates when it starts) or run `migrate`."
+        );
+    }
     Ok((pool, url))
+}
+
+/// Versions this build has that the database has not applied.
+async fn pending_migrations(pool: &PgPool) -> Result<Vec<i64>, String> {
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("database error: {e}"))?;
+    let applied: Vec<i64> = if exists {
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success").fetch_all(pool).await.map_err(|e| format!("database error: {e}"))?
+    } else {
+        Vec::new()
+    };
+    Ok(backend::MIGRATOR.iter().map(|m| m.version).filter(|v| !applied.contains(v)).collect())
+}
+
+fn is_local_pool(pool: &PgPool) -> bool {
+    let options = pool.connect_options();
+    let host = options.get_host();
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") || host.starts_with('/')
 }
 
 /// Splits a shell line into words: whitespace separates them, single and
@@ -359,7 +393,7 @@ async fn run(pool: &PgPool, command: &str, flags: &Flags) -> Result<(), String> 
         "revoke-key" => {
             let key_id = flags.req("key")?;
             found(accounts::revoke_key(&pool, key_id).await.map_err(db)?, "active key")?;
-            println!("Revoked {key_id}. Running servers reject it within 30 s.");
+            println!("Revoked {key_id}. Running servers reject it within their auth cache TTL (30 s by default).");
         }
         "accounts" => {
             let names = accounts::list_account_names(&pool).await.map_err(db)?;
@@ -419,6 +453,9 @@ async fn run(pool: &PgPool, command: &str, flags: &Flags) -> Result<(), String> 
         "extend-trial" => {
             let account_id = flags.req("account")?;
             let days: i64 = flags.req("days")?.parse().map_err(|_| "--days must be a number")?;
+            if days <= 0 {
+                return Err("--days must be greater than 0".to_owned());
+            }
             let ends = accounts::extend_trial(&pool, account_id, days).await.map_err(db)?.ok_or("account not found")?;
             println!("Trial for {account_id} now ends {}", ends.format("%Y-%m-%d %H:%M UTC"));
         }
@@ -428,7 +465,10 @@ async fn run(pool: &PgPool, command: &str, flags: &Flags) -> Result<(), String> 
             let keep_limits = flags.has("keep-limits");
             found(accounts::set_plan(&pool, account_id, plan, keep_limits).await.map_err(db)?, "account")?;
             let a = accounts::get_account(&pool, account_id).await.map_err(db)?.ok_or("account not found")?;
-            println!("{account_id} is now on the {} plan (running servers apply it within 30 s)", plan.as_str());
+            println!(
+                "{account_id} is now on the {} plan (running servers apply it within their auth cache TTL, 30 s by default)",
+                plan.as_str()
+            );
             print_limits(&a);
         }
         "set-limits" => {
@@ -441,6 +481,9 @@ async fn run(pool: &PgPool, command: &str, flags: &Flags) -> Result<(), String> 
         "extend-grace" => {
             let account_id = flags.req("account")?;
             let hours: i32 = flags.req("hours")?.parse().map_err(|_| "--hours must be a number")?;
+            if hours <= 0 {
+                return Err("--hours must be greater than 0".to_owned());
+            }
             let ends = accounts::extend_grace(&pool, account_id, hours).await.map_err(db)?.ok_or("account not found")?;
             println!("Grace period for {account_id} now ends {}", fmt_time(ends));
         }
@@ -448,6 +491,22 @@ async fn run(pool: &PgPool, command: &str, flags: &Flags) -> Result<(), String> 
             let account_id = flags.req("account")?;
             found(accounts::set_grace_end(&pool, account_id, None).await.map_err(db)?, "account")?;
             println!("{account_id} will get a new grace period the next time it goes over its hourly limit");
+        }
+        "migrate" => {
+            let pending = pending_migrations(&pool).await?;
+            if pending.is_empty() {
+                println!("Nothing to do: every migration is applied.");
+                return Ok(());
+            }
+            let list = pending.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
+            if !is_local_pool(&pool) && !flags.has("yes") {
+                return Err(format!(
+                    "this would apply migrations {list} to a database that is not on this machine; \
+                     run `migrate --yes` to go ahead"
+                ));
+            }
+            backend::migrate(&pool).await.map_err(|e| format!("migrations failed: {e}"))?;
+            println!("Applied migrations {list}.");
         }
         other => return Err(format!("unknown command '{other}' (type `help` for the list)")),
     }
