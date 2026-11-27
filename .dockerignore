@@ -1,0 +1,12 @@
+# Only Cargo.toml, Cargo.lock, src/ and migrations/ go into the build.
+# Secrets and the local database never leave this machine.
+.env
+.env.*
+.pgdata
+target
+.git
+.github
+tests
+examples
+scripts
+docker-compose.yml
